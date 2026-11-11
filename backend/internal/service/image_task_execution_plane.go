@@ -61,6 +61,9 @@ const (
 // ImageTaskExecution is the structured execution result stored on the task.
 // It is only present for tasks executed in safe mode.
 type ImageTaskExecution struct {
+	// UpstreamRequestID (YeaGrow T2.6) is the header-declared upstream ID of the
+	// last call; the callback falls back to the response-body id.
+	UpstreamRequestID  string `json:"upstream_request_id,omitempty"`
 	Outcome            string `json:"outcome"`
 	Reason             string `json:"reason,omitempty"`
 	Dispatched         bool   `json:"dispatched"`
@@ -101,9 +104,22 @@ type ExecutionPlaneTracker struct {
 	attemptCalls   int
 	attemptPreSend int
 
+	upstreamRequestID string
+
 	// YeaGrow T2.3: persists the dispatch marker before the first request.
 	recordDispatch   func(context.Context) error
 	dispatchRecorded bool
+}
+
+// ObserveUpstreamRequestID records the upstream request ID of the latest call
+// (YeaGrow T2.6). Empty IDs are ignored.
+func (t *ExecutionPlaneTracker) ObserveUpstreamRequestID(id string) {
+	if t == nil || id == "" {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.upstreamRequestID = id
 }
 
 // SetDispatchRecorder installs the hook that persists the dispatch marker of
@@ -288,6 +304,7 @@ func (t *ExecutionPlaneTracker) Snapshot() ImageTaskExecution {
 		Dispatched:         t.dispatched || t.inFlight > 0,
 		UpstreamCalls:      t.calls,
 		LastUpstreamStatus: t.lastStatus,
+		UpstreamRequestID:  t.upstreamRequestID,
 	}
 	switch {
 	case t.succeeded:

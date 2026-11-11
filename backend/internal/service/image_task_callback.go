@@ -261,6 +261,18 @@ func BuildImageTaskCallbackEvent(task *ImageTaskRecord) (*ImageTaskCallbackEvent
 		status := exec.LastUpstreamStatus
 		event.Upstream = &ImageTaskCallbackUpstream{HTTPStatus: &status}
 	}
+	// YeaGrow T2.6: upstream.request_id = header-declared ID, else the
+	// response-body id of a successful result.
+	requestID := SanitizeCorrelationID(exec.UpstreamRequestID)
+	if requestID == "" && exec.Outcome == ImageTaskOutcomeSucceeded {
+		requestID = UpstreamRequestIDFromJSONBody(task.Result)
+	}
+	if requestID != "" {
+		if event.Upstream == nil {
+			event.Upstream = &ImageTaskCallbackUpstream{}
+		}
+		event.Upstream.RequestID = &requestID
+	}
 	if exec.Outcome == ImageTaskOutcomeSucceeded {
 		event.Assets = append(event.Assets, task.Assets...)
 		return event, nil
