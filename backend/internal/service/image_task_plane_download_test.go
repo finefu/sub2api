@@ -39,7 +39,11 @@ func setPlaneDownloadPolicy(t *testing.T, p imageTaskPlaneDownloadPolicy) {
 // so a test can change the DNS answer between attempts.
 func (s *urlTestServer) guardedClientResolving(resolve func(host string) (string, bool), timeout time.Duration) *http.Client {
 	base := newImageDownloadBaseTransport(nil)
-	tlsCfg := s.srv.Client().Transport.(*http.Transport).TLSClientConfig.Clone()
+	clientTransport, ok := s.srv.Client().Transport.(*http.Transport)
+	if !ok {
+		panic("httptest TLS client transport is not *http.Transport")
+	}
+	tlsCfg := clientTransport.TLSClientConfig.Clone()
 	tlsCfg.ServerName = "example.com"
 	base.TLSClientConfig = tlsCfg
 	base.DisableKeepAlives = true // every attempt dials (and is checked) again
@@ -91,7 +95,11 @@ func answerStatus(code int, headers ...string) http.HandlerFunc {
 // resetMidBody sends half of a declared body and drops the connection.
 func resetMidBody(body []byte) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		conn, buf, err := w.(http.Hijacker).Hijack()
+		hijacker, ok := w.(http.Hijacker)
+		if !ok {
+			panic("response writer does not support hijacking")
+		}
+		conn, buf, err := hijacker.Hijack()
 		if err != nil {
 			panic(err)
 		}
@@ -108,7 +116,9 @@ func stallAfterHeaders(body []byte) http.HandlerFunc {
 		w.Header().Set("Content-Type", "image/png")
 		w.Header().Set("Content-Length", fmt.Sprint(len(body)))
 		_, _ = w.Write(body[:len(body)/2])
-		w.(http.Flusher).Flush()
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
 		select {
 		case <-r.Context().Done():
 		case <-time.After(10 * time.Second):
