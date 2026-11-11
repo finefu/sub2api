@@ -93,6 +93,12 @@ func newImageDownloadBaseTransport(control func(network, address string, c sysca
 	}
 }
 
+// SSRF guard refusals, identifiable so the execution-plane download retry never
+// retries them (messages unchanged).
+const imageDownloadAddressNotAllowed = "address not allowed for image download"
+
+var errImageDownloadHostNotAllowed = errors.New("image url host is not allowed")
+
 // imageDownloadDialControl 拒绝连接到非公网 IP。address 是 DNS 解析后的真实连接地址，
 // 多个解析结果时 Dialer 会跳过被拒地址继续尝试下一个。
 func imageDownloadDialControl(_, address string, _ syscall.RawConn) error {
@@ -101,7 +107,7 @@ func imageDownloadDialControl(_, address string, _ syscall.RawConn) error {
 		return err
 	}
 	if ip := net.ParseIP(stripIPv6Zone(host)); ip == nil || isPrivateIP(ip) {
-		return &net.AddrError{Err: "address not allowed for image download", Addr: address}
+		return &net.AddrError{Err: imageDownloadAddressNotAllowed, Addr: address}
 	}
 	return nil
 }
@@ -132,7 +138,7 @@ func (t *imageDownloadTransport) route(req *http.Request) (http.RoundTripper, er
 	}
 	host := req.URL.Hostname()
 	if isBlockedImageDownloadHost(host) {
-		return nil, fmt.Errorf("image url host is not allowed: %s", host)
+		return nil, fmt.Errorf("%w: %s", errImageDownloadHostNotAllowed, host)
 	}
 	var proxyURL *url.URL
 	if t.proxy != nil {
@@ -152,7 +158,7 @@ func (t *imageDownloadTransport) route(req *http.Request) (http.RoundTripper, er
 		return nil, fmt.Errorf("resolve image url host: %w", err)
 	}
 	if blocked {
-		return nil, fmt.Errorf("image url host is not allowed: %s", host)
+		return nil, fmt.Errorf("%w: %s", errImageDownloadHostNotAllowed, host)
 	}
 	return t.proxied, nil
 }

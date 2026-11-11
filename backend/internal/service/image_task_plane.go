@@ -24,6 +24,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	infraerrors "github.com/Wei-Shaw/sub2api/internal/pkg/errors"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
@@ -193,48 +194,58 @@ func ImageTaskAssetMetadata(runID string, spec *ImageTaskPlaneSpec, mimeType, sh
 // storeExecutionPlaneAsset writes the task's single image and verifies the
 // readback. It returns the asset descriptor and a compact result that keeps
 // the upstream envelope but replaces image data with the object key.
-func storeExecutionPlaneAsset(ctx context.Context, uploader *ImageResultUploader, task *ImageTaskRecord, result json.RawMessage) (*ImageTaskAsset, json.RawMessage, error) {
+// storeExecutionPlaneAsset downloads (with the bounded retry for result URLs,
+// see image_task_plane_download.go), cleans, writes and verifies the single
+// result image. downloads is the number of result-URL GETs started.
+func storeExecutionPlaneAsset(ctx context.Context, uploader *ImageResultUploader, task *ImageTaskRecord, result json.RawMessage, deadline time.Time) (*ImageTaskAsset, json.RawMessage, int, error) {
 	if uploader == nil || uploader.storage == nil {
-		return nil, nil, errors.New("object storage is not configured")
+		return nil, nil, 0, errors.New("object storage is not configured")
 	}
 	objects, ok := uploader.storage.(ImageObjectStorage)
 	if !ok {
-		return nil, nil, errors.New("object storage does not support metadata writes")
+		return nil, nil, 0, errors.New("object storage does not support metadata writes")
 	}
 	spec := task.Plane
 	var top map[string]json.RawMessage
 	if err := json.Unmarshal(result, &top); err != nil {
-		return nil, nil, fmt.Errorf("parse image response: %w", err)
+		return nil, nil, 0, fmt.Errorf("parse image response: %w", err)
 	}
 	var items []map[string]json.RawMessage
 	if err := json.Unmarshal(top["data"], &items); err != nil {
-		return nil, nil, fmt.Errorf("parse image response data: %w", err)
+		return nil, nil, 0, fmt.Errorf("parse image response data: %w", err)
 	}
 	if len(items) != 1 {
-		return nil, nil, fmt.Errorf("execution-plane task expects exactly 1 image, upstream returned %d", len(items))
+		return nil, nil, 0, fmt.Errorf("execution-plane task expects exactly 1 image, upstream returned %d", len(items))
 	}
 	planeUploader := *uploader
 	if planeUploader.maxDownloadBytes <= 0 || planeUploader.maxDownloadBytes > imageTaskPlaneMaxDownloadBytes {
 		planeUploader.maxDownloadBytes = imageTaskPlaneMaxDownloadBytes
 	}
-	data, _, err := planeUploader.fetchImageBytes(ctx, items[0])
+	var data []byte
+	var err error
+	downloads := 0
+	if rawURL, ok := planeItemDownloadURL(items[0]); ok {
+		data, _, downloads, err = planeUploader.downloadPlaneResult(ctx, rawURL, deadline)
+	} else {
+		data, _, err = planeUploader.fetchImageBytes(ctx, items[0])
+	}
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, downloads, err
 	}
 	if len(data) > imageTaskPlaneMaxDownloadBytes {
-		return nil, nil, fmt.Errorf("image size %d exceeds %d bytes", len(data), imageTaskPlaneMaxDownloadBytes)
+		return nil, nil, downloads, fmt.Errorf("image size %d exceeds %d bytes", len(data), imageTaskPlaneMaxDownloadBytes)
 	}
 	cleanedImage, err := imageTaskAssetCleaner(ctx, data, detectedImageContentType(data))
 	if err != nil {
-		return nil, nil, fmt.Errorf("clean image: %w", err)
+		return nil, nil, downloads, fmt.Errorf("clean image: %w", err)
 	}
 	data = cleanedImage.Bytes
 	mimeType := cleanedImage.MIMEType
 	if mimeType != "image/png" && mimeType != "image/jpeg" {
-		return nil, nil, fmt.Errorf("unsupported image type %q", mimeType)
+		return nil, nil, downloads, fmt.Errorf("unsupported image type %q", mimeType)
 	}
 	if len(data) < 1 || len(data) > ImageTaskAssetMaxBytes || cleanedImage.Width < 1 || cleanedImage.Height < 1 {
-		return nil, nil, fmt.Errorf("cleaned image size %d / %dx%d out of range", len(data), cleanedImage.Width, cleanedImage.Height)
+		return nil, nil, downloads, fmt.Errorf("cleaned image size %d / %dx%d out of range", len(data), cleanedImage.Width, cleanedImage.Height)
 	}
 	digest := sha256.Sum256(data)
 	digestHex := hex.EncodeToString(digest[:])
@@ -242,10 +253,10 @@ func storeExecutionPlaneAsset(ctx context.Context, uploader *ImageResultUploader
 	metadata := ImageTaskAssetMetadata(task.RunID, spec, mimeType, digestHex)
 
 	if err := objects.PutImageObject(ctx, key, mimeType, data, metadata, digest); err != nil {
-		return nil, nil, fmt.Errorf("put object: %w", err)
+		return nil, nil, downloads, fmt.Errorf("put object: %w", err)
 	}
 	if err := verifyStoredImageObject(ctx, objects, key, mimeType, metadata, digest); err != nil {
-		return nil, nil, err
+		return nil, nil, downloads, err
 	}
 
 	asset := &ImageTaskAsset{R2Key: key, MIME: mimeType, Width: cleanedImage.Width, Height: cleanedImage.Height, Bytes: int64(len(data)), SHA256: digestHex, Cleaned: true}
@@ -258,9 +269,9 @@ func storeExecutionPlaneAsset(ctx context.Context, uploader *ImageResultUploader
 	top["data"] = itemsRaw
 	compact, err := json.Marshal(top)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, downloads, err
 	}
-	return asset, compact, nil
+	return asset, compact, downloads, nil
 }
 
 // verifyStoredImageObject reads the object back and checks bytes, content
@@ -299,19 +310,37 @@ func logImageTaskStorageFailure(taskID string, err error) {
 
 func (s *ImageTaskService) completeExecutionPlane(ctx context.Context, task *ImageTaskRecord, statusCode int, result json.RawMessage, exec *ImageTaskExecution) error {
 	uploader, _ := s.current()
-	asset, compact, err := storeExecutionPlaneAsset(ctx, uploader, task, result)
+	// The task stays processing for the whole delivery, retries included.
+	now := time.Now()
+	deadline := imageTaskPlaneDeliveryDeadline(now, now, task.CreatedAt, s.ExecutionTimeout())
+	asset, compact, downloads, err := storeExecutionPlaneAsset(ctx, uploader, task, result, deadline)
 	if err != nil {
 		logImageTaskStorageFailure(task.ID, err)
-		return s.fail(ctx, task.ID, http.StatusBadGateway,
-			imageTaskErrorJSON("api_error", "failed to store generated image to object storage"),
-			planeStorageFailure(exec))
+		message := "failed to store generated image to object storage"
+		if downloads > 0 {
+			message += fmt.Sprintf(" (result download attempts: %d)", downloads)
+		}
+		return s.fail(ctx, task.ID, http.StatusBadGateway, imageTaskErrorJSON("api_error", message),
+			withDownloadAttempts(planeStorageFailure(exec), downloads))
 	}
-	return s.finishWithAssets(ctx, task.ID, ImageTaskStatusCompleted, statusCode, compact, nil, exec, []ImageTaskAsset{*asset})
+	return s.finishWithAssets(ctx, task.ID, ImageTaskStatusCompleted, statusCode, compact, nil,
+		withDownloadAttempts(exec, downloads), []ImageTaskAsset{*asset})
 }
 
 // planeStorageFailure marks the outcome uncertain/storage_failed. Without a
 // safe-mode record (exec == nil) it still records the outcome, because an
 // execution-plane task reached completion only after an upstream success.
+// withDownloadAttempts records the result-URL download count on the execution
+// record (the persisted tracker snapshot). nil stays nil (safe mode off).
+func withDownloadAttempts(exec *ImageTaskExecution, downloads int) *ImageTaskExecution {
+	if exec == nil || downloads == 0 {
+		return exec
+	}
+	out := *exec
+	out.DownloadAttempts = downloads
+	return &out
+}
+
 func planeStorageFailure(exec *ImageTaskExecution) *ImageTaskExecution {
 	if exec == nil {
 		return &ImageTaskExecution{Outcome: ImageTaskOutcomeUncertain, Reason: ImageTaskReasonStorageFailed, Dispatched: true}
