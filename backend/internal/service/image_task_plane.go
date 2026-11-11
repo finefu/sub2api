@@ -18,9 +18,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"image"
-	_ "image/jpeg" // DecodeConfig for image/jpeg
-	_ "image/png"  // DecodeConfig for image/png
 	"io"
 	"mime"
 	"mime/multipart"
@@ -169,15 +166,17 @@ type StoredImageObject struct {
 	Data           []byte
 }
 
-// ImageTaskAssetCleaner is the T2.5 call site: it receives the downloaded
-// bytes and their detected MIME type and returns the bytes to store and
-// whether YeaGrow's metadata cleaning was applied. Until T2.5 lands the
-// default returns the bytes unchanged with cleaned=false.
-type ImageTaskAssetCleaner func(ctx context.Context, data []byte, mimeType string) (out []byte, cleaned bool, err error)
+// ImageTaskAssetCleaner receives the downloaded bytes and their detected MIME
+// type and returns the bytes to store with YeaGrow's dimensions/digest. The
+// default (T2.5) is the byte-exact port of YeaGrow's cleaners; any rejection
+// fails the task as uncertain/storage_failed.
+type ImageTaskAssetCleaner func(ctx context.Context, data []byte, mimeType string) (*ImageCleanResult, error)
 
-var imageTaskAssetCleaner ImageTaskAssetCleaner = func(_ context.Context, data []byte, _ string) ([]byte, bool, error) {
-	return data, false, nil
-}
+var imageTaskAssetCleaner ImageTaskAssetCleaner = yeagrowImageAssetCleaner
+
+// imageTaskPlaneMaxDownloadBytes caps execution-plane result downloads (T2.5):
+// YeaGrow rejects stored images above 10 MiB, so nothing larger is fetched.
+const imageTaskPlaneMaxDownloadBytes = ImageTaskAssetMaxBytes
 
 // ImageTaskAssetMetadata is the exact customMetadata YeaGrow requires (six keys).
 func ImageTaskAssetMetadata(runID string, spec *ImageTaskPlaneSpec, mimeType, sha256Hex string) map[string]string {
@@ -214,25 +213,28 @@ func storeExecutionPlaneAsset(ctx context.Context, uploader *ImageResultUploader
 	if len(items) != 1 {
 		return nil, nil, fmt.Errorf("execution-plane task expects exactly 1 image, upstream returned %d", len(items))
 	}
-	data, _, err := uploader.fetchImageBytes(ctx, items[0])
+	planeUploader := *uploader
+	if planeUploader.maxDownloadBytes <= 0 || planeUploader.maxDownloadBytes > imageTaskPlaneMaxDownloadBytes {
+		planeUploader.maxDownloadBytes = imageTaskPlaneMaxDownloadBytes
+	}
+	data, _, err := planeUploader.fetchImageBytes(ctx, items[0])
 	if err != nil {
 		return nil, nil, err
 	}
-	mimeType := detectedImageContentType(data)
-	data, cleaned, err := imageTaskAssetCleaner(ctx, data, mimeType)
+	if len(data) > imageTaskPlaneMaxDownloadBytes {
+		return nil, nil, fmt.Errorf("image size %d exceeds %d bytes", len(data), imageTaskPlaneMaxDownloadBytes)
+	}
+	cleanedImage, err := imageTaskAssetCleaner(ctx, data, detectedImageContentType(data))
 	if err != nil {
 		return nil, nil, fmt.Errorf("clean image: %w", err)
 	}
-	mimeType = detectedImageContentType(data)
+	data = cleanedImage.Bytes
+	mimeType := cleanedImage.MIMEType
 	if mimeType != "image/png" && mimeType != "image/jpeg" {
 		return nil, nil, fmt.Errorf("unsupported image type %q", mimeType)
 	}
-	if len(data) < 1 || len(data) > ImageTaskAssetMaxBytes {
-		return nil, nil, fmt.Errorf("image size %d outside 1..%d bytes", len(data), ImageTaskAssetMaxBytes)
-	}
-	cfg, _, err := image.DecodeConfig(bytes.NewReader(data))
-	if err != nil || cfg.Width < 1 || cfg.Height < 1 {
-		return nil, nil, fmt.Errorf("decode image dimensions: %v", err)
+	if len(data) < 1 || len(data) > ImageTaskAssetMaxBytes || cleanedImage.Width < 1 || cleanedImage.Height < 1 {
+		return nil, nil, fmt.Errorf("cleaned image size %d / %dx%d out of range", len(data), cleanedImage.Width, cleanedImage.Height)
 	}
 	digest := sha256.Sum256(data)
 	digestHex := hex.EncodeToString(digest[:])
@@ -246,7 +248,7 @@ func storeExecutionPlaneAsset(ctx context.Context, uploader *ImageResultUploader
 		return nil, nil, err
 	}
 
-	asset := &ImageTaskAsset{R2Key: key, MIME: mimeType, Width: cfg.Width, Height: cfg.Height, Bytes: int64(len(data)), SHA256: digestHex, Cleaned: cleaned}
+	asset := &ImageTaskAsset{R2Key: key, MIME: mimeType, Width: cleanedImage.Width, Height: cleanedImage.Height, Bytes: int64(len(data)), SHA256: digestHex, Cleaned: true}
 	keyRaw, _ := json.Marshal(key)
 	compactItem := map[string]json.RawMessage{"r2_key": keyRaw}
 	if revised, ok := items[0]["revised_prompt"]; ok {
