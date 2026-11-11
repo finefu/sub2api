@@ -164,7 +164,7 @@ func (s *ImageTaskService) CreateIdempotent(ctx context.Context, owner ImageTask
 			return nil, ErrIdempotencyStoreUnavail.WithCause(err)
 		}
 		if claimed {
-			return s.createClaimedTask(ctx, repo, creator, claim.ID, owner, taskID, idemTTL)
+			return s.createClaimedTask(ctx, repo, creator, claim.ID, owner, taskID, key, idemTTL)
 		}
 
 		existing, err := repo.GetByScopeAndKeyHash(ctx, scope, keyHash)
@@ -202,7 +202,7 @@ func (s *ImageTaskService) CreateIdempotent(ctx context.Context, owner ImageTask
 					return nil, ErrIdempotencyStoreUnavail.WithCause(err)
 				}
 				if taken {
-					return s.createClaimedTask(ctx, repo, creator, existing.ID, owner, taskID, idemTTL)
+					return s.createClaimedTask(ctx, repo, creator, existing.ID, owner, taskID, key, idemTTL)
 				}
 			}
 		}
@@ -227,6 +227,7 @@ func (s *ImageTaskService) createClaimedTask(
 	claimID int64,
 	owner ImageTaskOwner,
 	taskID string,
+	runID string,
 	idemTTL time.Duration,
 ) (*ImageTaskSubmission, error) {
 	now := time.Now().UTC()
@@ -237,6 +238,7 @@ func (s *ImageTaskService) createClaimedTask(
 		Status:    ImageTaskStatusProcessing,
 		CreatedAt: now.Unix(),
 		ExpiresAt: now.Add(s.ttl).Unix(),
+		RunID:     runID,
 	}
 	created, err := creator.SaveIfAbsent(ctx, record, s.ttl)
 	if err != nil {

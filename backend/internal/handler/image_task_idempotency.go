@@ -18,6 +18,10 @@ import (
 func (h *AsyncImageHandler) createImageTask(c *gin.Context, apiKey *service.APIKey, body []byte) (*service.ImageTask, bool, error) {
 	owner := service.ImageTaskOwner{UserID: apiKey.UserID, APIKeyID: apiKey.ID}
 	rawKey := c.GetHeader("Idempotency-Key")
+	if h.tasks.CallbacksConfiguredFor(apiKey.ID) && !service.IsValidImageTaskRunID(strings.TrimSpace(rawKey)) {
+		// YeaGrow T2.2: callbacks carry run_id, which is the Idempotency-Key.
+		return nil, false, service.ErrImageTaskRunIDRequired
+	}
 	if strings.TrimSpace(rawKey) == "" {
 		task, err := h.tasks.Create(c.Request.Context(), owner)
 		return task, err == nil, err
