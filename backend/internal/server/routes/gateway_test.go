@@ -135,6 +135,7 @@ func TestGatewayRoutesAsyncImagesPathsAreRegistered(t *testing.T) {
 		"POST /v1/images/generations/async",
 		"POST /v1/images/edits/async",
 		"GET /v1/images/tasks/:task_id",
+		"GET /v1/execution-plane/status",
 		"POST /images/generations/async",
 		"POST /images/edits/async",
 		"GET /images/tasks/:task_id",
