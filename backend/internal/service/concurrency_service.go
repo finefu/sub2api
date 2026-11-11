@@ -213,6 +213,14 @@ func (s *ConcurrencyService) CleanupStaleProcessSlots(ctx context.Context) error
 	if s == nil || s.cache == nil {
 		return nil
 	}
+	// YeaGrow T2.3: the upstream cleanup removes every slot whose request ID
+	// does not carry this process's prefix, which deletes live slots of other
+	// instances sharing the Redis. In execution-plane mode the image task
+	// recovery removes only this instance's previous processes' slots instead.
+	if ImageTaskInstanceScopedSlotCleanupEnabled() {
+		logger.LegacyPrintf("service.concurrency", "Startup cleanup of foreign-prefix slots skipped: execution-plane mode cleans only this instance's slots")
+		return nil
+	}
 	return s.cache.CleanupStaleProcessSlots(ctx, RequestIDPrefix())
 }
 

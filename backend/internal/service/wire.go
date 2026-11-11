@@ -721,6 +721,8 @@ func ProvideImageTaskService(store ImageTaskStore, settings *ImageStorageSetting
 	svc := NewImageTaskServiceWithResolver(store, settings.Resolver(), defaultImageTaskTTL, defaultImageTaskExecutionTimeout)
 	// YeaGrow T2.2: callback delivery (no-op unless IMAGE_TASK_CALLBACKS[_FILE] is set).
 	StartImageTaskCallbacksFromEnv(svc)
+	// YeaGrow T2.3: in-flight index, restart recovery, drain (safe mode only).
+	ConfigureImageTaskExecutionPlaneFromEnv(svc, store)
 	return svc
 }
 

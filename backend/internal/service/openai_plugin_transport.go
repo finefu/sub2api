@@ -11,6 +11,15 @@ func (s *OpenAIGatewayService) SetPluginManager(manager *PluginManager) {
 func (s *OpenAIGatewayService) doOpenAIUpstream(request *http.Request, proxyURL string, account *Account) (*http.Response, error) {
 	// YeaGrow execution-plane safe mode: explicit dispatch markers (no-op without a tracker).
 	tracker := ExecutionPlaneTrackerFromContext(request.Context())
+	if err := tracker.RecordDispatch(request.Context()); err != nil {
+		// YeaGrow T2.3: without a persisted dispatch marker a restart could
+		// misreport this task as not_sent, so the request is not sent at all.
+		notRecorded := &ExecutionPlaneDispatchNotRecordedError{Err: err}
+		tracker.MarkUpstreamDispatching()
+		tracker.MarkNotSent(ImageTaskReasonDispatchNotRecorded)
+		tracker.ObserveUpstreamResult(nil, notRecorded)
+		return nil, notRecorded
+	}
 	tracker.MarkUpstreamDispatching()
 	resp, err := s.doOpenAIUpstreamTransport(request, proxyURL, account)
 	tracker.ObserveUpstreamResult(resp, err)

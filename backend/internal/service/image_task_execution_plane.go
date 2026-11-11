@@ -100,6 +100,39 @@ type ExecutionPlaneTracker struct {
 
 	attemptCalls   int
 	attemptPreSend int
+
+	// YeaGrow T2.3: persists the dispatch marker before the first request.
+	recordDispatch   func(context.Context) error
+	dispatchRecorded bool
+}
+
+// SetDispatchRecorder installs the hook that persists the dispatch marker of
+// the task (see ImageTaskService.DispatchRecorder). nil disables it.
+func (t *ExecutionPlaneTracker) SetDispatchRecorder(fn func(context.Context) error) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.recordDispatch = fn
+}
+
+// RecordDispatch persists the dispatch marker once, before the first upstream
+// request. A non-nil error means the request must not be sent.
+func (t *ExecutionPlaneTracker) RecordDispatch(ctx context.Context) error {
+	if t == nil {
+		return nil
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.recordDispatch == nil || t.dispatchRecorded {
+		return nil
+	}
+	if err := t.recordDispatch(ctx); err != nil {
+		return err
+	}
+	t.dispatchRecorded = true
+	return nil
 }
 
 func NewExecutionPlaneTracker() *ExecutionPlaneTracker {
@@ -297,6 +330,10 @@ func IsUpstreamPreSendError(err error) bool {
 	}
 	var dnsErr *net.DNSError
 	if errors.As(err, &dnsErr) {
+		return true
+	}
+	var notRecorded *ExecutionPlaneDispatchNotRecordedError
+	if errors.As(err, &notRecorded) {
 		return true
 	}
 	var opErr *net.OpError
