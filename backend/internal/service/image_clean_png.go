@@ -94,7 +94,7 @@ func parsePNG(b []byte) ([]pngChunk, *pngHeader) {
 		end := offset + int(length) + 12
 		name := b[offset+4 : offset+8]
 		for _, c := range name {
-			if !((c >= 65 && c <= 90) || (c >= 97 && c <= 122)) {
+			if (c < 65 || c > 90) && (c < 97 || c > 122) {
 				cleanFail("invalid_png_structure")
 			}
 		}
@@ -205,7 +205,7 @@ func validatePNGVisualChunk(typ string, data []byte, header *pngHeader, paletteE
 			cleanFail("invalid_png_structure")
 		}
 		for _, v := range data {
-			if !(v > 0 && v <= limit) {
+			if v == 0 || v > limit {
 				cleanFail("invalid_png_structure")
 			}
 		}
@@ -224,9 +224,10 @@ func validatePNGVisualChunk(typ string, data []byte, header *pngHeader, paletteE
 		}
 	case "bKGD":
 		want := 6
-		if header.color == 3 {
+		switch header.color {
+		case 3:
 			want = 1
-		} else if header.color == 0 || header.color == 4 {
+		case 0, 4:
 			want = 2
 		}
 		if len(data) != want || (header.color == 3 && (paletteEntries == 0 || int(data[0]) >= paletteEntries)) {
@@ -274,7 +275,7 @@ func readPNGKeyword(data []byte) (string, int) {
 	}
 	for i := 0; i < end; i++ {
 		c := data[i]
-		if !((c >= 32 && c <= 126) || c >= 161) || (c == 32 && i > 0 && data[i-1] == 32) {
+		if (c < 32 || c > 126) && c < 161 || (c == 32 && i > 0 && data[i-1] == 32) {
 			cleanFail("invalid_metadata")
 		}
 	}
@@ -666,7 +667,7 @@ func cleanEXIF(data []byte, maxBytes int, jpeg bool) ([]byte, int) {
 		cleanFail("invalid_exif")
 	}
 	little := data[0] == 73 && data[1] == 73
-	if !little && !(data[0] == 77 && data[1] == 77) {
+	if !little && (data[0] != 77 || data[1] != 77) {
 		cleanFail("invalid_exif")
 	}
 	var order binary.ByteOrder = binary.BigEndian

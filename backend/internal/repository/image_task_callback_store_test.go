@@ -30,7 +30,9 @@ func newCallbackTestStore(t *testing.T) (*miniredis.Miniredis, *redis.Client, *i
 	mr := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = rdb.Close() })
-	return mr, rdb, NewImageTaskStore(rdb).(*imageTaskStore)
+	store, ok := NewImageTaskStore(rdb).(*imageTaskStore)
+	require.True(t, ok)
+	return mr, rdb, store
 }
 
 func processingTask(id string) *service.ImageTaskRecord {
@@ -134,7 +136,7 @@ func verifyLikeYeaGrow(r *http.Request, body []byte, secret string, now time.Tim
 		return err
 	}
 	mac := hmac.New(sha256.New, []byte(secret))
-	mac.Write([]byte(ts + "." + string(body)))
+	_, _ = mac.Write([]byte(ts + "." + string(body)))
 	if !hmac.Equal(got, mac.Sum(nil)) {
 		return errors.New("bad signature")
 	}
@@ -239,7 +241,8 @@ func TestImageTaskCallbackSurvivesRestart(t *testing.T) {
 	// Process B: a fresh client on the same Redis, after the lease.
 	rdbB := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	defer func() { _ = rdbB.Close() }()
-	storeB := NewImageTaskStore(rdbB).(*imageTaskStore)
+	storeB, ok := NewImageTaskStore(rdbB).(*imageTaskStore)
+	require.True(t, ok)
 	clock := created.Add(61 * time.Second)
 	receiver := &recordingReceiver{statuses: []int{204}, clock: func() time.Time { return clock }}
 	server := httptest.NewServer(receiver)
