@@ -55,7 +55,11 @@ func newURLTestServer(t *testing.T, handler http.HandlerFunc) *urlTestServer {
 // runs on it, and only allowed connections reach the test server.
 func (s *urlTestServer) guardedClient(dns map[string]string, timeout time.Duration) *http.Client {
 	base := newImageDownloadBaseTransport(nil)
-	tlsCfg := s.srv.Client().Transport.(*http.Transport).TLSClientConfig.Clone()
+	clientTransport, ok := s.srv.Client().Transport.(*http.Transport)
+	if !ok {
+		panic("httptest TLS client transport is not *http.Transport")
+	}
+	tlsCfg := clientTransport.TLSClientConfig.Clone()
 	tlsCfg.ServerName = "example.com" // httptest certificate name
 	base.TLSClientConfig = tlsCfg
 	target := s.srv.Listener.Addr().String()
@@ -202,7 +206,9 @@ func TestExecutionPlaneURLDownloadFailuresAreUncertainStorageFailed(t *testing.T
 			w.Header().Set("Content-Type", "image/png")
 			w.Header().Set("Content-Length", fmt.Sprint(len(image)))
 			_, _ = w.Write(image[:len(image)/2])
-			w.(http.Flusher).Flush()
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
 			select {
 			case <-r.Context().Done():
 			case <-time.After(5 * time.Second):

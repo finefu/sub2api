@@ -32,7 +32,7 @@ This fork (`finefu/sub2api`, branch `yeagrow/execution-plane`) carries patches t
 | T2.5 metadata cleaning | Byte-exact Go port of YeaGrow's PNG/JPEG metadata cleaning (golden samples in `backend/internal/service/testdata/imageclean`). Rejected images fail as `uncertain` / `storage_failed`. Execution-plane downloads are capped at 10 MiB. | always on for execution-plane tasks |
 | T2.6 probe switch (planned) | Turn off the Responses capability probe sent when an OpenAI API-key account is created or updated. **Not in this branch yet.** | `ACCOUNT_RESPONSES_PROBE_ENABLED` (planned) |
 
-Deployment notes: Redis must run with `maxmemory-policy noeviction` and AOF enabled (task records, callback queue and in-flight index live there). The image storage bucket must be YeaGrow's generated-image bucket. CI for this branch: `.github/workflows/yeagrow-execution-plane.yml` (Go 1.27.3 default + `-tags=unit` tests with one visible rerun of failing packages, image build with digest; publishing to GHCR is disabled unless the repository variable `YEAGROW_PUBLISH_GHCR` is `true`).
+Deployment notes: Redis must run with `maxmemory-policy noeviction` and AOF enabled (task records, callback queue and in-flight index live there). The image storage bucket must be YeaGrow's generated-image bucket. CI for this branch: `.github/workflows/yeagrow-execution-plane.yml` (Go 1.27.4 default + `-tags=unit` tests with one visible rerun of failing packages, image build with digest; publishing to GHCR is disabled unless the repository variable `YEAGROW_PUBLISH_GHCR` is `true`).
 
 ## ⚠️ Important Notice
 
