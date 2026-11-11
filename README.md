@@ -18,6 +18,22 @@ English | [中文](README_CN.md) | [日本語](README_JA.md)
 
 </div>
 
+## YeaGrow execution-plane patches (this fork)
+
+This fork (`finefu/sub2api`, branch `yeagrow/execution-plane`) carries patches that let YeaGrow use Sub2API's asynchronous image tasks as its execution plane. **Base:** upstream [Wei-Shaw/sub2api](https://github.com/Wei-Shaw/sub2api) at `ee58c0013`. **License:** like upstream, LGPL-3.0 ([LICENSE](LICENSE)); every patch file names its origin in a header comment, and the complete modified source is published on this branch. With all switches at their defaults the gateway behaves like upstream, except that async image tasks are kept 7 days instead of 24 hours and an `Idempotency-Key` on async image submits is honoured.
+
+| Patch | What it changes | Switches / environment (default) |
+| --- | --- | --- |
+| P0 safe mode | Async image tasks never replay an upstream request that may have generated an image (5xx, timeout, disconnect); only provable pre-send failures or 4xx/529 rejections switch accounts; pool-mode same-account retry is off. Tasks record `execution.outcome` = `not_sent` / `rejected` / `uncertain` / `succeeded`. Grok async tasks are refused. | `IMAGE_TASK_EXECUTION_PLANE_SAFE_MODE` (`false`) |
+| T2.1 idempotency | `Idempotency-Key` on `POST /images/{generations,edits}/async` (per API key): same key + same request → same `task_id` (HTTP 200); different request → 409. Claims live in Postgres `idempotency_records`, tasks are created with Redis `SET NX`. | always on when the header is sent |
+| T2.2 callbacks | Signed terminal-state callback per task (`X-Exec-Timestamp`, `X-Exec-Signature` = hex HMAC-SHA256 of `<ts>.<body>`), queued atomically with the terminal state; retries 10s/30s/2m/10m/30m/2h, given up after 24h; survives restarts. API keys with a target must send a run ID as `Idempotency-Key`. | `IMAGE_TASK_CALLBACKS_FILE` (YAML/JSON, preferred) or `IMAGE_TASK_CALLBACKS`: `[{api_key_id, url, secret}]` (unset = off); `IMAGE_TASK_CALLBACKS_ALLOW_HTTP` (`false`, local testing only) |
+| T2.3 restart recovery | In-flight index per instance, dispatch marker before the first upstream request, startup recovery (dispatched → `uncertain`, never sent → `not_sent`, one callback each), instance-scoped concurrency-slot cleanup, SIGTERM drain. Active only with safe mode. | `SUB2API_INSTANCE_ID` (`default`; unique per instance sharing a Redis), `IMAGE_TASK_SHUTDOWN_DRAIN_TIMEOUT` (`120s`; `0` = no wait) |
+| T2.4 object storage | Execution-plane submits (`X-YeaGrow-Asset-Prefix: generated/<run_id>/`, `X-YeaGrow-Asset-Metadata: {"route_version","provider_id","created_at"}`, `n = 1`) store the image at `generated/<run_id>/image-0` with exact user metadata and an `x-amz-checksum-sha256`, then read it back and verify it. Callback and `GET /images/tasks/{id}` carry only the key. Task records are kept 7 days. | uses the upstream image storage settings (`IMAGE_STORAGE_*`; settings saved in the admin UI take precedence over env) |
+| T2.5 metadata cleaning | Byte-exact Go port of YeaGrow's PNG/JPEG metadata cleaning (golden samples in `backend/internal/service/testdata/imageclean`). Rejected images fail as `uncertain` / `storage_failed`. Execution-plane downloads are capped at 10 MiB. | always on for execution-plane tasks |
+| T2.6 probe switch (planned) | Turn off the Responses capability probe sent when an OpenAI API-key account is created or updated. **Not in this branch yet.** | `ACCOUNT_RESPONSES_PROBE_ENABLED` (planned) |
+
+Deployment notes: Redis must run with `maxmemory-policy noeviction` and AOF enabled (task records, callback queue and in-flight index live there). The image storage bucket must be YeaGrow's generated-image bucket. CI for this branch: `.github/workflows/yeagrow-execution-plane.yml` (Go 1.27.3 default + `-tags=unit` tests with one visible rerun of failing packages, image build with digest; publishing to GHCR is disabled unless the repository variable `YEAGROW_PUBLISH_GHCR` is `true`).
+
 ## ⚠️ Important Notice
 
 Please read the following carefully before using this project:
