@@ -24,11 +24,14 @@ type AsyncImageHandler struct {
 	tasks   *service.ImageTaskService
 	openAI  *OpenAIGatewayHandler
 	execute func(platform string, c *gin.Context)
+	// safeMode: YeaGrow execution-plane safe mode (IMAGE_TASK_EXECUTION_PLANE_SAFE_MODE).
+	safeMode bool
 }
 
 func NewAsyncImageHandler(tasks *service.ImageTaskService, openAI *OpenAIGatewayHandler) *AsyncImageHandler {
 	h := &AsyncImageHandler{tasks: tasks, openAI: openAI}
 	h.execute = h.executeWithGateway
+	h.safeMode = asyncImageSafeModeFromEnv()
 	return h
 }
 
@@ -64,6 +67,10 @@ func (h *AsyncImageHandler) Submit(c *gin.Context) {
 	}
 	if platform != service.PlatformOpenAI && platform != service.PlatformGrok {
 		imageTaskJSONError(c, http.StatusNotFound, "not_found_error", "Images API is not supported for this platform")
+		return
+	}
+	if !h.safeModeSupportsPlatform(platform) {
+		imageTaskJSONError(c, http.StatusNotFound, "not_found_error", "async image tasks in execution-plane safe mode support only the OpenAI platform")
 		return
 	}
 	if !service.GroupAllowsImageGeneration(apiKey.Group) {
@@ -108,6 +115,7 @@ func (h *AsyncImageHandler) Submit(c *gin.Context) {
 		}
 		return
 	}
+	h.attachExecutionPlaneTracker(taskCtx)
 	task, err := h.tasks.Create(c.Request.Context(), service.ImageTaskOwner{UserID: apiKey.UserID, APIKeyID: apiKey.ID})
 	if err != nil {
 		cancel()
@@ -229,17 +237,21 @@ func (h *AsyncImageHandler) executeWithGateway(platform string, c *gin.Context) 
 
 func (h *AsyncImageHandler) run(taskID, platform string, taskCtx *gin.Context, recorder *httptest.ResponseRecorder, cancel context.CancelFunc) {
 	defer cancel()
+	tracker := service.ExecutionPlaneTrackerFromContext(taskCtx.Request.Context())
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			logger.L().Error("image_task.execution_panicked", zap.String("task_id", taskID), zap.Any("panic", recovered))
-			h.failTask(taskID, http.StatusInternalServerError, imageTaskErrorPayload("api_error", "image generation task panicked"))
+			h.failTask(taskID, http.StatusInternalServerError, imageTaskErrorPayload("api_error", "image generation task panicked"),
+				service.ExecutionForFinishedTask(tracker, false, false, service.ImageTaskReasonPanic))
 		}
 	}()
 
 	h.execute(platform, taskCtx)
 	body := bytes.TrimSpace(recorder.Body.Bytes())
-	if err := taskCtx.Request.Context().Err(); err != nil && len(body) == 0 {
-		h.failTask(taskID, http.StatusGatewayTimeout, imageTaskErrorPayload("timeout_error", "image generation task timed out"))
+	timedOut := taskCtx.Request.Context().Err() != nil
+	if timedOut && len(body) == 0 {
+		h.failTask(taskID, http.StatusGatewayTimeout, imageTaskErrorPayload("timeout_error", "image generation task timed out"),
+			service.ExecutionForFinishedTask(tracker, false, true, ""))
 		return
 	}
 	statusCode := recorder.Code
@@ -248,19 +260,32 @@ func (h *AsyncImageHandler) run(taskID, platform string, taskCtx *gin.Context, r
 	}
 	if statusCode >= http.StatusOK && statusCode < http.StatusMultipleChoices {
 		if len(body) == 0 || !json.Valid(body) {
-			h.failTask(taskID, http.StatusBadGateway, imageTaskErrorPayload("api_error", "upstream returned an invalid image response"))
+			h.failTask(taskID, http.StatusBadGateway, imageTaskErrorPayload("api_error", "upstream returned an invalid image response"),
+				service.ExecutionForFinishedTask(tracker, false, timedOut, service.ImageTaskReasonInvalidResponse))
 			return
 		}
-		if err := h.tasks.Complete(context.Background(), taskID, statusCode, json.RawMessage(body)); err != nil {
+		var err error
+		if tracker != nil {
+			err = h.tasks.CompleteWithExecution(context.Background(), taskID, statusCode, json.RawMessage(body), service.ExecutionForFinishedTask(tracker, true, false, ""))
+		} else {
+			err = h.tasks.Complete(context.Background(), taskID, statusCode, json.RawMessage(body))
+		}
+		if err != nil {
 			logger.L().Error("image_task.complete_store_failed", zap.String("task_id", taskID), zap.Error(err))
 		}
 		return
 	}
-	h.failTask(taskID, statusCode, extractImageTaskError(body))
+	h.failTask(taskID, statusCode, extractImageTaskError(body), service.ExecutionForFinishedTask(tracker, false, timedOut, ""))
 }
 
-func (h *AsyncImageHandler) failTask(taskID string, statusCode int, taskErr json.RawMessage) {
-	if err := h.tasks.Fail(context.Background(), taskID, statusCode, taskErr); err != nil {
+func (h *AsyncImageHandler) failTask(taskID string, statusCode int, taskErr json.RawMessage, exec *service.ImageTaskExecution) {
+	var err error
+	if exec != nil {
+		err = h.tasks.FailWithExecution(context.Background(), taskID, statusCode, taskErr, exec)
+	} else {
+		err = h.tasks.Fail(context.Background(), taskID, statusCode, taskErr)
+	}
+	if err != nil {
 		logger.L().Error("image_task.failure_store_failed", zap.String("task_id", taskID), zap.Error(err))
 	}
 }
