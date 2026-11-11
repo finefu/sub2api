@@ -69,6 +69,9 @@ type ImageTaskExecution struct {
 	Dispatched         bool   `json:"dispatched"`
 	UpstreamCalls      int    `json:"upstream_calls"`
 	LastUpstreamStatus int    `json:"last_upstream_status,omitempty"`
+	// DownloadAttempts counts result-URL GETs (execution-plane download retry);
+	// 0 / absent for inline b64_json results.
+	DownloadAttempts int `json:"download_attempts,omitempty"`
 }
 
 // ImageTaskExecutionPlaneSafeModeFromEnv parses IMAGE_TASK_EXECUTION_PLANE_SAFE_MODE.

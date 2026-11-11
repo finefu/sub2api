@@ -173,9 +173,12 @@ func TestExecutionPlaneURLDownloadFailuresAreUncertainStorageFailed(t *testing.T
 	image := testPNG(t, 8, 8)
 	const host = "img-cdn.vncps.com"
 	publicDNS := map[string]string{host: "203.0.113.10"}
+	// Transient failures are retried (3 GETs of the same URL), permanent ones are not.
+	useFastPlaneDownloadPolicy(t)
 	cases := map[string]struct {
-		handler http.HandlerFunc
-		timeout time.Duration
+		handler   http.HandlerFunc
+		timeout   time.Duration
+		retryable bool
 	}{
 		"404": {handler: func(w http.ResponseWriter, r *http.Request) { http.NotFound(w, r) }},
 		"403 expired signature": {handler: func(w http.ResponseWriter, r *http.Request) {
@@ -183,19 +186,19 @@ func TestExecutionPlaneURLDownloadFailuresAreUncertainStorageFailed(t *testing.T
 			w.WriteHeader(http.StatusForbidden)
 			_, _ = w.Write([]byte("<Error><Code>AccessDenied</Code><Message>Request has expired</Message></Error>"))
 		}},
-		"500": {handler: func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusInternalServerError) }},
+		"500": {retryable: true, handler: func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusInternalServerError) }},
 		"oversized (10 MiB + 1)": {handler: func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "image/png")
 			_, _ = w.Write(image)
 			_, _ = w.Write(make([]byte, ImageTaskAssetMaxBytes+1-len(image)))
 		}},
-		"headers never arrive": {timeout: 300 * time.Millisecond, handler: func(w http.ResponseWriter, r *http.Request) {
+		"headers never arrive": {retryable: true, timeout: 300 * time.Millisecond, handler: func(w http.ResponseWriter, r *http.Request) {
 			select {
 			case <-r.Context().Done():
 			case <-time.After(5 * time.Second):
 			}
 		}},
-		"body stalls": {timeout: 300 * time.Millisecond, handler: func(w http.ResponseWriter, r *http.Request) {
+		"body stalls": {retryable: true, timeout: 300 * time.Millisecond, handler: func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "image/png")
 			w.Header().Set("Content-Length", fmt.Sprint(len(image)))
 			_, _ = w.Write(image[:len(image)/2])
@@ -228,9 +231,15 @@ func TestExecutionPlaneURLDownloadFailuresAreUncertainStorageFailed(t *testing.T
 			svc, store, storage := newPlaneURLService(t, server.guardedClient(publicDNS, timeout))
 			started := time.Now()
 			completeURL(t, svc, "https://"+host+"/aigc/x.png")
-			require.Less(t, time.Since(started), 4*time.Second, "bounded by the client timeout")
-			require.EqualValues(t, 1, server.hits.Load(), "downloaded once, never resubmitted upstream")
+			require.Less(t, time.Since(started), 4*time.Second, "bounded by the client timeout and the retry policy")
+			want := int64(1)
+			if tc.retryable {
+				want = int64(imageTaskPlaneDownload.MaxAttempts)
+			}
+			require.EqualValues(t, want, server.hits.Load(), "GETs of the result URL (the upstream POST is never repeated)")
 			requireStorageFailed(t, store, storage)
+			rec, _ := store.Get(context.Background(), cbTestTaskID)
+			require.EqualValues(t, want, rec.Execution.DownloadAttempts)
 		})
 	}
 }
