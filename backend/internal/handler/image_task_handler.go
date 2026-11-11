@@ -195,7 +195,21 @@ func (h *AsyncImageHandler) Get(c *gin.Context) {
 		imageTaskError(c, service.ErrImageTaskForbidden)
 		return
 	}
-	task, err := h.tasks.Get(c.Request.Context(), service.ImageTaskOwner{UserID: apiKey.UserID, APIKeyID: apiKey.ID}, c.Param("task_id"))
+	owner := service.ImageTaskOwner{UserID: apiKey.UserID, APIKeyID: apiKey.ID}
+	// YeaGrow T2.4: execution-plane tasks answer with the callback body (shared serializer).
+	if view, isPlane, err := h.tasks.GetExecutionPlaneView(c.Request.Context(), owner, c.Param("task_id")); err != nil || isPlane {
+		if err != nil {
+			imageTaskError(c, err)
+			return
+		}
+		c.Header("Cache-Control", "no-store")
+		if _, processing := view.(*service.ImageTaskQueryProcessing); processing {
+			c.Header("Retry-After", "3")
+		}
+		c.JSON(http.StatusOK, view)
+		return
+	}
+	task, err := h.tasks.Get(c.Request.Context(), owner, c.Param("task_id"))
 	if err != nil {
 		imageTaskError(c, err)
 		return

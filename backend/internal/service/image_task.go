@@ -19,7 +19,8 @@ const (
 	ImageTaskStatusCompleted  = "completed"
 	ImageTaskStatusFailed     = "failed"
 
-	defaultImageTaskTTL              = 24 * time.Hour
+	// YeaGrow execution plane: >= 7 days so the fallback query outlives the 24h callback window.
+	defaultImageTaskTTL              = 7 * 24 * time.Hour
 	defaultImageTaskExecutionTimeout = 30 * time.Minute
 )
 
@@ -48,6 +49,8 @@ type ImageTaskRecord struct {
 	RunID string `json:"run_id,omitempty"`
 	// Assets (YeaGrow T2.4/T2.5) describe stored, cleaned images for the callback.
 	Assets []ImageTaskAsset `json:"assets,omitempty"`
+	// Plane (YeaGrow T2.4) is set for execution-plane tasks (object key and R2 metadata).
+	Plane *ImageTaskPlaneSpec `json:"plane,omitempty"`
 }
 
 // ImageTask is the API-safe task representation returned to callers.
@@ -207,6 +210,12 @@ func (s *ImageTaskService) complete(ctx context.Context, id string, statusCode i
 	if !json.Valid(result) {
 		return s.fail(ctx, id, http.StatusBadGateway, imageTaskErrorJSON("api_error", "upstream returned a non-JSON image response"), downgradeImageTaskExecution(exec, ImageTaskReasonInvalidResponse))
 	}
+	if s != nil && s.store != nil {
+		if task, err := s.store.Get(ctx, id); err == nil && task.Plane != nil && task.Status == ImageTaskStatusProcessing {
+			// YeaGrow T2.4: write generated/<run_id>/image-0 with R2 metadata, verify, key only.
+			return s.completeExecutionPlane(ctx, task, statusCode, result, exec)
+		}
+	}
 	if uploader, _ := s.current(); uploader != nil {
 		rewritten, err := uploader.Rewrite(ctx, id, result)
 		if err != nil {
@@ -231,6 +240,10 @@ func (s *ImageTaskService) fail(ctx context.Context, id string, statusCode int, 
 }
 
 func (s *ImageTaskService) finish(ctx context.Context, id, status string, statusCode int, result, taskErr json.RawMessage, exec *ImageTaskExecution) error {
+	return s.finishWithAssets(ctx, id, status, statusCode, result, taskErr, exec, nil)
+}
+
+func (s *ImageTaskService) finishWithAssets(ctx context.Context, id, status string, statusCode int, result, taskErr json.RawMessage, exec *ImageTaskExecution, assets []ImageTaskAsset) error {
 	if s == nil || s.store == nil {
 		return ErrImageTaskUnavailable
 	}
@@ -254,6 +267,7 @@ func (s *ImageTaskService) finish(ctx context.Context, id, status string, status
 	task.Error = taskErr
 	task.CompletedAt = &completedAt
 	task.Execution = exec
+	task.Assets = assets
 	task.ExpiresAt = now.Add(s.ttl).Unix()
 	if finisher, ok := s.store.(ImageTaskFinishStore); ok {
 		// YeaGrow T2.2: processing -> terminal CAS and callback enqueue in one Lua script.
