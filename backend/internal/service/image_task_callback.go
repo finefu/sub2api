@@ -56,9 +56,7 @@ const (
 
 	imageTaskCallbackRequestTimeout = 15 * time.Second
 	imageTaskCallbackLease          = 60 * time.Second
-	imageTaskCallbackPollInterval   = time.Second
-	imageTaskCallbackBatch          = 32
-	imageTaskCallbackParallel       = 8
+	// Claim batch, delivery concurrency and poll interval: see image_task_callback_tuning.go.
 )
 
 // imageTaskCallbackBackoff is the contract retry schedule; the last step repeats.
@@ -423,6 +421,7 @@ type ImageTaskCallbackDeliverer struct {
 	config *ImageTaskCallbackConfig
 	client *http.Client
 	now    func() time.Time
+	tuning ImageTaskCallbackTuning
 
 	stopOnce sync.Once
 	stop     chan struct{}
@@ -438,23 +437,41 @@ func NewImageTaskCallbackDeliverer(queue ImageTaskCallbackQueue, config *ImageTa
 		}
 	}
 	return &ImageTaskCallbackDeliverer{queue: queue, config: config, client: client, now: time.Now,
-		stop: make(chan struct{}), done: make(chan struct{})}
+		tuning: DefaultImageTaskCallbackTuning(), stop: make(chan struct{}), done: make(chan struct{})}
 }
 
-// Start runs the delivery loop until Stop.
+// Start runs the delivery loop until Stop. A round that claimed events is
+// followed immediately by the next claim (the due queue may hold more); only
+// an empty or failed round waits for the poll interval.
 func (d *ImageTaskCallbackDeliverer) Start() {
 	go func() {
 		defer close(d.done)
-		ticker := time.NewTicker(imageTaskCallbackPollInterval)
-		defer ticker.Stop()
+		timer := time.NewTimer(0)
+		defer timer.Stop()
 		for {
-			if _, err := d.RunOnce(context.Background()); err != nil {
+			stats, err := d.RunOnce(context.Background())
+			if err != nil {
 				logger.L().Warn("image_task.callback_poll_failed", zap.Error(err))
 			}
+			if err == nil && stats.Claimed > 0 {
+				select {
+				case <-d.stop:
+					return
+				default:
+					continue
+				}
+			}
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(d.tuning.PollInterval)
 			select {
 			case <-d.stop:
 				return
-			case <-ticker.C:
+			case <-timer.C:
 			}
 		}
 	}()
@@ -468,19 +485,20 @@ func (d *ImageTaskCallbackDeliverer) Stop() {
 
 // ImageTaskCallbackRunStats summarizes one RunOnce.
 type ImageTaskCallbackRunStats struct {
-	Delivered, Retried, Abandoned int
+	Claimed, Delivered, Retried, Abandoned int
 }
 
 // RunOnce claims due events and attempts each once.
 func (d *ImageTaskCallbackDeliverer) RunOnce(ctx context.Context) (ImageTaskCallbackRunStats, error) {
 	var stats ImageTaskCallbackRunStats
-	envelopes, err := d.queue.ClaimDueCallbacks(ctx, d.now(), imageTaskCallbackLease, imageTaskCallbackBatch)
+	envelopes, err := d.queue.ClaimDueCallbacks(ctx, d.now(), imageTaskCallbackLease, d.tuning.Batch)
 	if err != nil || len(envelopes) == 0 {
 		return stats, err
 	}
+	stats.Claimed = len(envelopes)
 	var mu sync.Mutex
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, imageTaskCallbackParallel)
+	sem := make(chan struct{}, d.tuning.Concurrency)
 	for _, env := range envelopes {
 		wg.Add(1)
 		sem <- struct{}{}
@@ -612,9 +630,11 @@ func StartImageTaskCallbacksFromEnv(svc *ImageTaskService) *ImageTaskCallbackDel
 		return nil
 	}
 	svc.SetCallbackConfig(cfg)
-	deliverer := NewImageTaskCallbackDeliverer(queue, cfg, nil)
+	deliverer := NewImageTaskCallbackDeliverer(queue, cfg, nil).WithTuning(LoadImageTaskCallbackTuningFromEnv())
 	deliverer.Start()
-	logger.L().Info("image_task.callbacks_enabled", zap.Int("targets", cfg.Len()))
+	tuning := deliverer.Tuning()
+	logger.L().Info("image_task.callbacks_enabled", zap.Int("targets", cfg.Len()), zap.Int("batch", tuning.Batch),
+		zap.Int("concurrency", tuning.Concurrency), zap.Duration("poll_interval", tuning.PollInterval))
 	return deliverer
 }
 
