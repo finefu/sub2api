@@ -381,6 +381,7 @@ func (h *OpenAIGatewayHandler) Images(c *gin.Context) {
 				if executionPlane.LastAttemptNotSent() && service.OpenAIImagesJSONKeepaliveAdjustedWrittenSize(c) == writerSizeBeforeForward {
 					// Safe mode: the connection was never established, so trying
 					// another account cannot produce a second image.
+					h.gatewayService.RecordOpenAIAccountSwitch()
 					failedAccountIDs[account.ID] = struct{}{}
 					if switchCount >= maxAccountSwitches {
 						h.handleFailoverExhaustedSimple(c, http.StatusBadGateway, streamStarted)
