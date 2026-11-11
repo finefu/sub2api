@@ -51,6 +51,16 @@ type ImageTaskRecord struct {
 	Assets []ImageTaskAsset `json:"assets,omitempty"`
 	// Plane (YeaGrow T2.4) is set for execution-plane tasks (object key and R2 metadata).
 	Plane *ImageTaskPlaneSpec `json:"plane,omitempty"`
+	// InstanceID / OwnerProcess (YeaGrow T2.3) identify the in-flight index
+	// and the process that executes the task.
+	InstanceID   string `json:"instance_id,omitempty"`
+	OwnerProcess string `json:"owner_process,omitempty"`
+	// DispatchedAt (YeaGrow T2.3, unix ms) is persisted before the first
+	// upstream request is sent; recovery uses it to tell uncertain from not_sent.
+	DispatchedAt *int64 `json:"dispatched_at,omitempty"`
+	// StoringAt (YeaGrow T2.3, unix ms) is persisted before the result is
+	// written to object storage; a restart after it is always uncertain.
+	StoringAt *int64 `json:"storing_at,omitempty"`
 }
 
 // ImageTask is the API-safe task representation returned to callers.
@@ -97,6 +107,8 @@ type ImageTaskService struct {
 	idempotencyRepo IdempotencyRepository
 	// callbacks: YeaGrow T2.2 callback targets (see image_task_callback.go).
 	callbacks *ImageTaskCallbackConfig
+	// plane (YeaGrow T2.3): in-flight index, recovery and drain; nil when off.
+	plane *imageTaskExecutionPlane
 }
 
 func NewImageTaskService(store ImageTaskStore) *ImageTaskService {
@@ -178,7 +190,11 @@ func (s *ImageTaskService) Create(ctx context.Context, owner ImageTaskOwner) (*I
 		CreatedAt: now.Unix(),
 		ExpiresAt: now.Add(s.ttl).Unix(),
 	}
+	if err := s.registerInflight(ctx, task); err != nil {
+		return nil, ErrImageTaskUnavailable.WithCause(err)
+	}
 	if err := s.store.Save(ctx, task, s.ttl); err != nil {
+		s.unregisterInflight(context.WithoutCancel(ctx), task)
 		return nil, ErrImageTaskUnavailable.WithCause(err)
 	}
 	return imageTaskToPublic(task), nil
@@ -211,12 +227,27 @@ func (s *ImageTaskService) complete(ctx context.Context, id string, statusCode i
 		return s.fail(ctx, id, http.StatusBadGateway, imageTaskErrorJSON("api_error", "upstream returned a non-JSON image response"), downgradeImageTaskExecution(exec, ImageTaskReasonInvalidResponse))
 	}
 	if s != nil && s.store != nil {
-		if task, err := s.store.Get(ctx, id); err == nil && task.Plane != nil && task.Status == ImageTaskStatusProcessing {
-			// YeaGrow T2.4: write generated/<run_id>/image-0 with R2 metadata, verify, key only.
-			return s.completeExecutionPlane(ctx, task, statusCode, result, exec)
+		if task, err := s.store.Get(ctx, id); err == nil {
+			if task.Status != ImageTaskStatusProcessing && s.plane != nil {
+				// YeaGrow T2.3: the task was already finished (e.g. by restart
+				// recovery). Do not store the late result: the finish CAS would
+				// reject it anyway and the object would be orphaned.
+				logger.L().Warn("image_task.late_result_dropped", zap.String("task_id", id), zap.String("current_status", task.Status))
+				return ErrImageTaskAlreadyFinished
+			}
+			if task.Plane != nil && task.Status == ImageTaskStatusProcessing {
+				if err := s.markStoring(ctx, id); err != nil {
+					return err
+				}
+				// YeaGrow T2.4: write generated/<run_id>/image-0 with R2 metadata, verify, key only.
+				return s.completeExecutionPlane(ctx, task, statusCode, result, exec)
+			}
 		}
 	}
 	if uploader, _ := s.current(); uploader != nil {
+		if err := s.markStoring(ctx, id); err != nil {
+			return err
+		}
 		rewritten, err := uploader.Rewrite(ctx, id, result)
 		if err != nil {
 			// 转存失败不回退存 base64，避免大 blob 撑爆 Redis：直接把任务标记为失败。
@@ -276,6 +307,7 @@ func (s *ImageTaskService) finishWithAssets(ctx context.Context, id, status stri
 	if err := s.store.Save(ctx, task, s.ttl); err != nil {
 		return ErrImageTaskUnavailable.WithCause(err)
 	}
+	s.unregisterInflight(ctx, task)
 	return nil
 }
 

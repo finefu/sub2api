@@ -259,8 +259,15 @@ func (s *ImageTaskService) createClaimedTask(
 		RunID:     runID,
 		Plane:     plane,
 	}
+	if err := s.registerInflight(ctx, record); err != nil {
+		if markErr := repo.MarkFailedRetryable(context.WithoutCancel(ctx), claimID, "IMAGE_TASK_STORE_UNAVAILABLE", time.Now(), time.Now().Add(idemTTL)); markErr != nil {
+			logger.L().Warn("image_task.idempotency_release_failed", zap.Int64("claim_id", claimID), zap.Error(markErr))
+		}
+		return nil, ErrImageTaskUnavailable.WithCause(err)
+	}
 	created, err := creator.SaveIfAbsent(ctx, record, s.ttl)
 	if err != nil {
+		s.unregisterInflight(context.WithoutCancel(ctx), record)
 		// Nothing was created: release the claim for an immediate retry.
 		if markErr := repo.MarkFailedRetryable(context.WithoutCancel(ctx), claimID, "IMAGE_TASK_STORE_UNAVAILABLE", time.Now(), time.Now().Add(idemTTL)); markErr != nil {
 			logger.L().Warn("image_task.idempotency_release_failed", zap.Int64("claim_id", claimID), zap.Error(markErr))

@@ -20,6 +20,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/handler"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/Wei-Shaw/sub2api/internal/server/middleware"
+	"github.com/Wei-Shaw/sub2api/internal/service"
 	"github.com/Wei-Shaw/sub2api/internal/setup"
 	"github.com/Wei-Shaw/sub2api/internal/web"
 
@@ -183,6 +184,10 @@ func runMainServer() {
 	<-quit
 
 	log.Println("Shutting down server...")
+
+	// YeaGrow T2.3: refuse new async image tasks and let running ones finish
+	// (bounded by IMAGE_TASK_SHUTDOWN_DRAIN_TIMEOUT) while polls still work.
+	service.DrainImageTasksForShutdown()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

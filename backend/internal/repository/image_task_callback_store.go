@@ -38,8 +38,9 @@ func imageTaskCallbackEventKey(eventID string) string {
 }
 
 // imageTaskFinishScript: CAS processing -> terminal and enqueue the event in one step.
-// KEYS: task, due zset, event hash. ARGV: new record, ttl ms, has event, event id,
-// body, api key id, created ms, event ttl ms.
+// KEYS: task, due zset, event hash, in-flight index (YeaGrow T2.3). ARGV: new
+// record, ttl ms, has event, event id, body, api key id, created ms, event ttl ms,
+// task id (removed from the in-flight index together with the transition).
 var imageTaskFinishScript = redis.NewScript(`
 local current = redis.call('GET', KEYS[1])
 if not current then
@@ -50,6 +51,7 @@ if not ok or type(decoded) ~= 'table' or decoded['status'] ~= 'processing' then
   return 'not_processing'
 end
 redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[2])
+redis.call('ZREM', KEYS[4], ARGV[9])
 if ARGV[3] == '1' then
   redis.call('DEL', KEYS[3])
   redis.call('HSET', KEYS[3], 'body', ARGV[5], 'api_key_id', ARGV[6], 'created_ms', ARGV[7], 'failures', '0')
@@ -86,8 +88,8 @@ func (s *imageTaskStore) FinishProcessing(ctx context.Context, next *service.Ima
 	}
 	eventTTL := service.ImageTaskCallbackGiveUpAfter + service.ImageTaskCallbackRetention
 	res, err := imageTaskFinishScript.Run(ctx, s.rdb,
-		[]string{imageTaskKey(next.ID), imageTaskCallbackDueKey, eventKey},
-		string(data), ttl.Milliseconds(), hasEvent, eventID, body, apiKeyID, createdMS, eventTTL.Milliseconds(),
+		[]string{imageTaskKey(next.ID), imageTaskCallbackDueKey, eventKey, imageTaskInflightKey(next.InstanceID)},
+		string(data), ttl.Milliseconds(), hasEvent, eventID, body, apiKeyID, createdMS, eventTTL.Milliseconds(), next.ID,
 	).Text()
 	if err != nil {
 		return 0, err

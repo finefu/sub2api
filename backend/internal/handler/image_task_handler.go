@@ -115,17 +115,30 @@ func (h *AsyncImageHandler) Submit(c *gin.Context) {
 		}
 		return
 	}
+	// YeaGrow T2.3: no new tasks while draining for shutdown.
+	releaseRun, accepting := h.tasks.BeginRun()
+	if !accepting {
+		cancel()
+		c.Header("Retry-After", "5")
+		imageTaskJSONError(c, http.StatusServiceUnavailable, "service_unavailable", "this gateway instance is shutting down; retry the request")
+		return
+	}
 	h.attachExecutionPlaneTracker(taskCtx)
 	task, created, err := h.createImageTask(c, apiKey, body)
 	if err != nil {
+		releaseRun()
 		cancel()
 		imageTaskError(c, err)
 		return
 	}
 	if !created {
+		releaseRun()
 		cancel()
 		respondReplayedImageTask(c, task)
 		return
+	}
+	if tracker := service.ExecutionPlaneTrackerFromContext(taskCtx.Request.Context()); tracker != nil {
+		tracker.SetDispatchRecorder(h.tasks.DispatchRecorder(task.ID))
 	}
 
 	pollURL := imageTaskPollURL(c.Request.URL.Path, task.ID)
@@ -142,7 +155,10 @@ func (h *AsyncImageHandler) Submit(c *gin.Context) {
 		"poll_url":   pollURL,
 	})
 
-	go h.run(task.ID, platform, taskCtx, recorder, cancel)
+	go func() {
+		defer releaseRun()
+		h.run(task.ID, platform, taskCtx, recorder, cancel)
+	}()
 }
 
 func (h *AsyncImageHandler) checkSecurityAuditBeforeSubmit(c *gin.Context, apiKey *service.APIKey, platform string, body []byte) bool {
