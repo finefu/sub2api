@@ -116,10 +116,15 @@ func (h *AsyncImageHandler) Submit(c *gin.Context) {
 		return
 	}
 	h.attachExecutionPlaneTracker(taskCtx)
-	task, err := h.tasks.Create(c.Request.Context(), service.ImageTaskOwner{UserID: apiKey.UserID, APIKeyID: apiKey.ID})
+	task, created, err := h.createImageTask(c, apiKey, body)
 	if err != nil {
 		cancel()
 		imageTaskError(c, err)
+		return
+	}
+	if !created {
+		cancel()
+		respondReplayedImageTask(c, task)
 		return
 	}
 

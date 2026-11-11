@@ -86,6 +86,8 @@ type ImageTaskService struct {
 	resolve          ImageStorageResolver
 	ttl              time.Duration
 	executionTimeout time.Duration
+	// idempotencyRepo: YeaGrow T2.1 idempotent submits (see image_task_idempotency.go).
+	idempotencyRepo IdempotencyRepository
 }
 
 func NewImageTaskService(store ImageTaskStore) *ImageTaskService {
