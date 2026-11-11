@@ -2,10 +2,14 @@ package service
 
 import (
 	"net/http"
+	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 
 	infraerrors "github.com/Wei-Shaw/sub2api/internal/pkg/errors"
+	"github.com/tidwall/gjson"
 	"golang.org/x/net/http/httpguts"
 )
 
@@ -88,4 +92,87 @@ func ValidateUpstreamRequestIDHeaderExtra(extra map[string]any) error {
 	}
 	extra[AccountExtraUpstreamRequestIDHeader] = name
 	return nil
+}
+
+// ---- YeaGrow T2.6: client request ID passthrough and response-body fallback ----
+
+// ClientRequestIDHeader carries the caller's correlation ID (YeaGrow's
+// dispatchId) to the upstream on the Images path only.
+const ClientRequestIDHeader = "X-Client-Request-Id"
+
+// safeCorrelationID matches IDs that are safe to forward and to store:
+// ASCII letters, digits and ._:- (YeaGrow SAFE_PROVIDER_REQUEST_ID), at most
+// the usage_logs column width.
+var safeCorrelationID = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,128}$`)
+
+// SanitizeCorrelationID returns id trimmed if it is a safe correlation ID, else "".
+func SanitizeCorrelationID(id string) string {
+	id = strings.TrimSpace(id)
+	if !safeCorrelationID.MatchString(id) {
+		return ""
+	}
+	return id
+}
+
+// ClientRequestIDForUpstream returns the caller-supplied X-Client-Request-Id
+// when it is a safe ID. The gateway's own generated correlation ID is never
+// forwarded.
+func ClientRequestIDForUpstream(h http.Header) string {
+	if h == nil {
+		return ""
+	}
+	return SanitizeCorrelationID(h.Get(ClientRequestIDHeader))
+}
+
+// setClientRequestIDHeader sets the header after account header overrides so
+// an override cannot replace the caller's ID; any casing variant is removed first.
+func setClientRequestIDHeader(h http.Header, id string) {
+	if h == nil || id == "" {
+		return
+	}
+	for existing := range h {
+		if strings.EqualFold(existing, ClientRequestIDHeader) {
+			delete(h, existing)
+		}
+	}
+	h.Set(ClientRequestIDHeader, id)
+}
+
+// UpstreamRequestIDFromJSONBody returns the top-level "id" of an upstream JSON
+// response (OpenAI-compatible image APIs such as Kemei return the task ID
+// there and no request-ID header), or "" if absent or unsafe.
+func UpstreamRequestIDFromJSONBody(body []byte) string {
+	if len(body) == 0 || !gjson.ValidBytes(body) {
+		return ""
+	}
+	id := gjson.GetBytes(body, "id")
+	if id.Type != gjson.String {
+		return ""
+	}
+	return SanitizeCorrelationID(id.String())
+}
+
+// usageUpstreamRequestIDPtrWithBodyFallback is usageUpstreamRequestIDPtr with
+// the response-body ID as fallback when the configured header is missing.
+func usageUpstreamRequestIDPtrWithBodyFallback(account *Account, h http.Header, wsMode bool, bodyID string) *string {
+	if id := usageUpstreamRequestIDPtr(account, h, wsMode); id != nil || wsMode {
+		return id
+	}
+	if bodyID = SanitizeCorrelationID(bodyID); bodyID != "" {
+		return &bodyID
+	}
+	return nil
+}
+
+// AccountResponsesProbeEnabledEnv toggles the Responses-API capability probe
+// that runs when an OpenAI API-key account is created, re-keyed or imported
+// (YeaGrow T2.6). Default: off, so adding an image-only account sends nothing
+// to the upstream.
+const AccountResponsesProbeEnabledEnv = "ACCOUNT_RESPONSES_PROBE_ENABLED"
+
+// AccountResponsesProbeEnabled reports whether the probe is enabled; an
+// unparsable value counts as off.
+func AccountResponsesProbeEnabled() bool {
+	enabled, err := strconv.ParseBool(strings.TrimSpace(os.Getenv(AccountResponsesProbeEnabledEnv)))
+	return err == nil && enabled
 }

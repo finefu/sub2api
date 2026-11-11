@@ -22,6 +22,11 @@ func (s *OpenAIGatewayService) doOpenAIUpstream(request *http.Request, proxyURL 
 	}
 	tracker.MarkUpstreamDispatching()
 	resp, err := s.doOpenAIUpstreamTransport(request, proxyURL, account)
+	if resp != nil && tracker != nil {
+		// YeaGrow T2.6: header-declared upstream ID for the callback (the
+		// response-body id is the fallback, see BuildImageTaskCallbackEvent).
+		tracker.ObserveUpstreamRequestID(SanitizeCorrelationID(UpstreamRequestIDFromHeaders(account, resp.Header)))
+	}
 	tracker.ObserveUpstreamResult(resp, err)
 	return resp, err
 }
