@@ -130,7 +130,7 @@ func TestExecutionPlaneCompleteWritesKeyMetadataChecksumAndCallback(t *testing.T
 	rec, err := store.Get(context.Background(), cbTestTaskID)
 	require.NoError(t, err)
 	require.Equal(t, ImageTaskStatusCompleted, rec.Status)
-	require.Equal(t, []ImageTaskAsset{{R2Key: "generated/" + planeRunID + "/image-0", MIME: "image/png", Width: 3, Height: 2, Bytes: int64(len(pngBytes)), SHA256: digestHex, Cleaned: false}}, rec.Assets)
+	require.Equal(t, []ImageTaskAsset{{R2Key: "generated/" + planeRunID + "/image-0", MIME: "image/png", Width: 3, Height: 2, Bytes: int64(len(pngBytes)), SHA256: digestHex, Cleaned: true}}, rec.Assets)
 	require.NotContains(t, string(rec.Result), "b64_json")
 	require.NotContains(t, string(rec.Result), "://")
 	require.Contains(t, string(rec.Result), `"r2_key":"generated/run_exec_plane_1/image-0"`)
@@ -140,7 +140,7 @@ func TestExecutionPlaneCompleteWritesKeyMetadataChecksumAndCallback(t *testing.T
 	body := string(store.events[0].Body)
 	require.Contains(t, body, `"status":"succeeded"`)
 	require.Contains(t, body, `"assets":[{"r2_key":"generated/run_exec_plane_1/image-0","mime":"image/png","width":3,"height":2,"bytes":`)
-	require.Contains(t, body, `"cleaned":false`, "T2.5 not implemented yet")
+	require.Contains(t, body, `"cleaned":true`)
 	require.NotContains(t, body, "://", "no URL in the callback")
 }
 
@@ -149,9 +149,9 @@ func TestExecutionPlaneCleanerHookIsTheT25CallSite(t *testing.T) {
 	t.Cleanup(func() { imageTaskAssetCleaner = original })
 	cleanedBytes := testPNG(t, 4, 4)
 	var gotMime string
-	imageTaskAssetCleaner = func(_ context.Context, data []byte, mimeType string) ([]byte, bool, error) {
+	imageTaskAssetCleaner = func(_ context.Context, data []byte, mimeType string) (*ImageCleanResult, error) {
 		gotMime = mimeType
-		return cleanedBytes, true, nil
+		return &ImageCleanResult{Bytes: cleanedBytes, MIMEType: "image/png", Width: 4, Height: 4}, nil
 	}
 	storage := newMemObjectStorage()
 	svc, store := newPlaneService(t, storage)
