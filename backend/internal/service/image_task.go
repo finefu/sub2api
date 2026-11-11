@@ -42,6 +42,8 @@ type ImageTaskRecord struct {
 	CreatedAt   int64           `json:"created_at"`
 	CompletedAt *int64          `json:"completed_at,omitempty"`
 	ExpiresAt   int64           `json:"expires_at"`
+	// Execution is set only in YeaGrow execution-plane safe mode.
+	Execution *ImageTaskExecution `json:"execution,omitempty"`
 }
 
 // ImageTask is the API-safe task representation returned to callers.
@@ -57,6 +59,8 @@ type ImageTask struct {
 	CreatedAt   int64           `json:"created_at"`
 	CompletedAt *int64          `json:"completed_at,omitempty"`
 	ExpiresAt   int64           `json:"expires_at"`
+	// Execution is set only in YeaGrow execution-plane safe mode.
+	Execution *ImageTaskExecution `json:"execution,omitempty"`
 }
 
 type ImageTaskOwner struct {
@@ -188,29 +192,37 @@ func (s *ImageTaskService) Get(ctx context.Context, owner ImageTaskOwner, id str
 }
 
 func (s *ImageTaskService) Complete(ctx context.Context, id string, statusCode int, result json.RawMessage) error {
+	return s.complete(ctx, id, statusCode, result, nil)
+}
+
+func (s *ImageTaskService) complete(ctx context.Context, id string, statusCode int, result json.RawMessage, exec *ImageTaskExecution) error {
 	if !json.Valid(result) {
-		return s.Fail(ctx, id, http.StatusBadGateway, imageTaskErrorJSON("api_error", "upstream returned a non-JSON image response"))
+		return s.fail(ctx, id, http.StatusBadGateway, imageTaskErrorJSON("api_error", "upstream returned a non-JSON image response"), downgradeImageTaskExecution(exec, ImageTaskReasonInvalidResponse))
 	}
 	if uploader, _ := s.current(); uploader != nil {
 		rewritten, err := uploader.Rewrite(ctx, id, result)
 		if err != nil {
 			// 转存失败不回退存 base64，避免大 blob 撑爆 Redis：直接把任务标记为失败。
 			logger.L().Error("image_task.offload_failed", zap.String("task_id", id), zap.Error(err))
-			return s.Fail(ctx, id, http.StatusBadGateway, imageTaskErrorJSON("api_error", "failed to store generated image to object storage"))
+			return s.fail(ctx, id, http.StatusBadGateway, imageTaskErrorJSON("api_error", "failed to store generated image to object storage"), downgradeImageTaskExecution(exec, ImageTaskReasonStorageFailed))
 		}
 		result = rewritten
 	}
-	return s.finish(ctx, id, ImageTaskStatusCompleted, statusCode, result, nil)
+	return s.finish(ctx, id, ImageTaskStatusCompleted, statusCode, result, nil, exec)
 }
 
 func (s *ImageTaskService) Fail(ctx context.Context, id string, statusCode int, taskErr json.RawMessage) error {
+	return s.fail(ctx, id, statusCode, taskErr, nil)
+}
+
+func (s *ImageTaskService) fail(ctx context.Context, id string, statusCode int, taskErr json.RawMessage, exec *ImageTaskExecution) error {
 	if !json.Valid(taskErr) {
 		taskErr = imageTaskErrorJSON("api_error", "image generation failed")
 	}
-	return s.finish(ctx, id, ImageTaskStatusFailed, statusCode, nil, taskErr)
+	return s.finish(ctx, id, ImageTaskStatusFailed, statusCode, nil, taskErr, exec)
 }
 
-func (s *ImageTaskService) finish(ctx context.Context, id, status string, statusCode int, result, taskErr json.RawMessage) error {
+func (s *ImageTaskService) finish(ctx context.Context, id, status string, statusCode int, result, taskErr json.RawMessage, exec *ImageTaskExecution) error {
 	if s == nil || s.store == nil {
 		return ErrImageTaskUnavailable
 	}
@@ -228,6 +240,7 @@ func (s *ImageTaskService) finish(ctx context.Context, id, status string, status
 	task.Result = result
 	task.Error = taskErr
 	task.CompletedAt = &completedAt
+	task.Execution = exec
 	task.ExpiresAt = now.Add(s.ttl).Unix()
 	if err := s.store.Save(ctx, task, s.ttl); err != nil {
 		return ErrImageTaskUnavailable.WithCause(err)
@@ -251,6 +264,7 @@ func imageTaskToPublic(task *ImageTaskRecord) *ImageTask {
 		CreatedAt:   task.CreatedAt,
 		CompletedAt: task.CompletedAt,
 		ExpiresAt:   task.ExpiresAt,
+		Execution:   task.Execution,
 	}
 }
 

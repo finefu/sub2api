@@ -168,6 +168,8 @@ func (h *OpenAIGatewayHandler) Images(c *gin.Context) {
 	jsonKeepaliveStarted := false
 	defer func() { stopJSONKeepalive() }()
 	var oauth429FailoverState service.OpenAIOAuth429FailoverState
+	// YeaGrow execution-plane safe mode (async image tasks only); nil otherwise.
+	executionPlane := service.ExecutionPlaneTrackerFromContext(c.Request.Context())
 
 	for {
 		reqLog.Debug("openai.images.account_selecting", zap.Int("excluded_account_count", len(failedAccountIDs)))
@@ -189,6 +191,7 @@ func (h *OpenAIGatewayHandler) Images(c *gin.Context) {
 				zap.Int("excluded_account_count", len(failedAccountIDs)),
 			)
 			if len(failedAccountIDs) == 0 {
+				executionPlane.MarkNotSent(service.ImageTaskReasonNoAccount)
 				if tier, unsupported := h.gatewayService.OpenAIImageSizeTierUnsupported(c.Request.Context(), apiKey.GroupID, routingModel, parsed.Size, "", parsed.RequiredCapabilityForModel(channelMapping.MappedModel)); unsupported {
 					service.MarkOpsClientBusinessLimited(c, service.OpsClientBusinessLimitedReasonLocalModelConfiguration)
 					h.handleStreamingAwareError(c, http.StatusBadRequest, "invalid_request_error", service.OpenAIImageSizeTierUnsupportedMessage(parsed.Size, tier), streamStarted)
@@ -213,6 +216,7 @@ func (h *OpenAIGatewayHandler) Images(c *gin.Context) {
 			return
 		}
 		if selection == nil || selection.Account == nil {
+			executionPlane.MarkNotSent(service.ImageTaskReasonNoAccount)
 			cls := classifyNoAccountErrorFromGin(c, h.gatewayService, apiKey, clientRequestModel, routingModel, service.PlatformOpenAI)
 			if !cls.ModelNotFound {
 				markOpsRoutingCapacityLimited(c)
@@ -259,6 +263,7 @@ func (h *OpenAIGatewayHandler) Images(c *gin.Context) {
 		}
 		forwardStart := time.Now()
 		writerSizeBeforeForward := service.OpenAIImagesJSONKeepaliveAdjustedWrittenSize(c)
+		executionPlane.BeginAttempt()
 		result, err := func() (*service.OpenAIForwardResult, error) {
 			defer func() {
 				if accountReleaseFunc != nil {
@@ -324,7 +329,15 @@ func (h *OpenAIGatewayHandler) Images(c *gin.Context) {
 						)
 						return
 					}
-					if failoverErr.RetryableOnSameAccount {
+					if !executionPlane.AllowsAccountSwitch() {
+						reqLog.Warn("openai.images.execution_plane_no_replay",
+							zap.Int64("account_id", account.ID),
+							zap.Int("upstream_status", failoverErr.StatusCode),
+						)
+						h.handleFailoverExhausted(c, failoverErr, streamStarted)
+						return
+					}
+					if failoverErr.RetryableOnSameAccount && executionPlane.AllowsSameAccountRetry() {
 						retryLimit := effectiveSameAccountRetryLimit(failoverErr, account)
 						if sameAccountRetryAllowed(failoverErr, sameAccountRetryCount[account.ID], retryLimit) {
 							sameAccountRetryCount[account.ID]++
@@ -365,6 +378,22 @@ func (h *OpenAIGatewayHandler) Images(c *gin.Context) {
 					continue
 				}
 				h.gatewayService.ReportOpenAIAccountScheduleResult(account, openAIAccountScheduleModel(c, account, requestModel, false, result), false, nil, err)
+				if executionPlane.LastAttemptNotSent() && service.OpenAIImagesJSONKeepaliveAdjustedWrittenSize(c) == writerSizeBeforeForward {
+					// Safe mode: the connection was never established, so trying
+					// another account cannot produce a second image.
+					failedAccountIDs[account.ID] = struct{}{}
+					if switchCount >= maxAccountSwitches {
+						h.handleFailoverExhaustedSimple(c, http.StatusBadGateway, streamStarted)
+						return
+					}
+					switchCount++
+					reqLog.Warn("openai.images.execution_plane_switch_after_connect_failure",
+						zap.Int64("account_id", account.ID),
+						zap.Int("switch_count", switchCount),
+						zap.Error(err),
+					)
+					continue
+				}
 				upstreamErrorAlreadyCommunicated := openAIForwardErrorAlreadyCommunicated(c, writerSizeBeforeForward, err)
 				wroteFallback := false
 				if !upstreamErrorAlreadyCommunicated {
@@ -383,6 +412,9 @@ func (h *OpenAIGatewayHandler) Images(c *gin.Context) {
 				reqLog.Error("openai.images.forward_failed", fields...)
 				return
 			}
+		}
+		if err == nil {
+			executionPlane.MarkSucceeded()
 		}
 		if result != nil {
 			// 排除 spark 影子:其 codex_* 仅由 QueryUsage(/wham/usage bengalfox)更新(外审第7轮 P1)。
