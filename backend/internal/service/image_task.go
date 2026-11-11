@@ -44,6 +44,10 @@ type ImageTaskRecord struct {
 	ExpiresAt   int64           `json:"expires_at"`
 	// Execution is set only in YeaGrow execution-plane safe mode.
 	Execution *ImageTaskExecution `json:"execution,omitempty"`
+	// RunID (YeaGrow T2.2) is the Idempotency-Key the task was created under.
+	RunID string `json:"run_id,omitempty"`
+	// Assets (YeaGrow T2.4/T2.5) describe stored, cleaned images for the callback.
+	Assets []ImageTaskAsset `json:"assets,omitempty"`
 }
 
 // ImageTask is the API-safe task representation returned to callers.
@@ -88,6 +92,8 @@ type ImageTaskService struct {
 	executionTimeout time.Duration
 	// idempotencyRepo: YeaGrow T2.1 idempotent submits (see image_task_idempotency.go).
 	idempotencyRepo IdempotencyRepository
+	// callbacks: YeaGrow T2.2 callback targets (see image_task_callback.go).
+	callbacks *ImageTaskCallbackConfig
 }
 
 func NewImageTaskService(store ImageTaskStore) *ImageTaskService {
@@ -235,6 +241,11 @@ func (s *ImageTaskService) finish(ctx context.Context, id, status string, status
 		}
 		return ErrImageTaskUnavailable.WithCause(err)
 	}
+	if task.Status != ImageTaskStatusProcessing {
+		logger.L().Warn("image_task.finish_rejected_not_processing",
+			zap.String("task_id", id), zap.String("current_status", task.Status), zap.String("attempted_status", status))
+		return ErrImageTaskAlreadyFinished
+	}
 	now := time.Now().UTC()
 	completedAt := now.Unix()
 	task.Status = status
@@ -244,6 +255,10 @@ func (s *ImageTaskService) finish(ctx context.Context, id, status string, status
 	task.CompletedAt = &completedAt
 	task.Execution = exec
 	task.ExpiresAt = now.Add(s.ttl).Unix()
+	if finisher, ok := s.store.(ImageTaskFinishStore); ok {
+		// YeaGrow T2.2: processing -> terminal CAS and callback enqueue in one Lua script.
+		return s.finishAtomically(ctx, finisher, task, status, now)
+	}
 	if err := s.store.Save(ctx, task, s.ttl); err != nil {
 		return ErrImageTaskUnavailable.WithCause(err)
 	}
