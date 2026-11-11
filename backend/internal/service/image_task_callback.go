@@ -141,7 +141,7 @@ func ParseImageTaskCallbackConfig(raw []byte, allowHTTP bool) (*ImageTaskCallbac
 			return nil, fmt.Errorf("image task callbacks[%d]: duplicate api_key_id %d", i, t.APIKeyID)
 		}
 		u, err := url.Parse(t.URL)
-		if err != nil || u.Host == "" || (u.Scheme != "https" && !(allowHTTP && u.Scheme == "http")) {
+		if err != nil || u.Host == "" || (u.Scheme != "https" && (!allowHTTP || u.Scheme != "http")) {
 			return nil, fmt.Errorf("image task callbacks[%d]: url must be an absolute https URL", i)
 		}
 		if len(t.Secret) < imageTaskCallbackMinSecretLen {
@@ -163,7 +163,7 @@ func LoadImageTaskCallbackConfigFromEnv() (*ImageTaskCallbackConfig, error) {
 	allowHTTP, _ := strconv.ParseBool(strings.TrimSpace(os.Getenv(ImageTaskCallbacksAllowHTTPEnv)))
 	switch {
 	case path != "":
-		raw, err := os.ReadFile(path)
+		raw, err := os.ReadFile(path) //nolint:gosec // G703: path is the operator-set IMAGE_TASK_CALLBACKS_FILE, not request input
 		if err != nil {
 			return nil, fmt.Errorf("read %s: %w", ImageTaskCallbacksFileEnv, err)
 		}
@@ -321,7 +321,7 @@ func imageTaskCallbackErrorMessage(exec *ImageTaskExecution, taskErr json.RawMes
 		if r < 0x20 || r > 0x7e {
 			r = '?'
 		}
-		b.WriteRune(r)
+		_, _ = b.WriteRune(r)
 		if b.Len() >= imageTaskCallbackMaxMessage {
 			break
 		}
@@ -332,9 +332,9 @@ func imageTaskCallbackErrorMessage(exec *ImageTaskExecution, taskErr json.RawMes
 // SignImageTaskCallback returns hex(HMAC-SHA256(secret, "<timestamp>.<body>")).
 func SignImageTaskCallback(secret string, timestamp int64, body []byte) string {
 	mac := hmac.New(sha256.New, []byte(secret))
-	mac.Write([]byte(strconv.FormatInt(timestamp, 10)))
-	mac.Write([]byte("."))
-	mac.Write(body)
+	_, _ = mac.Write([]byte(strconv.FormatInt(timestamp, 10))) // hash.Hash writes never fail
+	_, _ = mac.Write([]byte("."))
+	_, _ = mac.Write(body)
 	return hex.EncodeToString(mac.Sum(nil))
 }
 

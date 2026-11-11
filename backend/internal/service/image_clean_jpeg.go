@@ -431,7 +431,7 @@ func validateSOS(payload []byte, f *jpegFrame, tables map[string]*jpegHuffman, s
 		cleanFail("invalid_jpeg_structure")
 	}
 	high, low := approx>>4, approx&0x0f
-	if f.marker != 0xc2 && !(start == 0 && end == 63 && approx == 0) {
+	if f.marker != 0xc2 && (start != 0 || end != 63 || approx != 0) {
 		cleanFail("invalid_jpeg_structure")
 	}
 	if f.marker == 0xc2 {
@@ -990,8 +990,8 @@ func parseJPEG(b []byte, depth int, work *int64) jpegParseResult {
 		keep := true
 		var scan *jpegScan
 
-		switch {
-		case marker == 0xc0 || marker == 0xc1 || marker == 0xc2:
+		switch marker {
+		case 0xc0, 0xc1, 0xc2:
 			candidate := parseJPEGFrame(int(marker), payload)
 			if frame != nil {
 				cleanFail("duplicate_jpeg_segment")
@@ -1000,16 +1000,16 @@ func parseJPEG(b []byte, depth int, work *int64) jpegParseResult {
 			if frame.marker == 0xc2 {
 				coefficients = newProgressiveCoefficients(frame)
 			}
-		case marker == 0xdb:
+		case 0xdb:
 			validateDQT(payload, quantization)
-		case marker == 0xc4:
+		case 0xc4:
 			validateDHT(payload, huffman)
-		case marker == 0xdd:
+		case 0xdd:
 			if len(payload) != 2 {
 				cleanFail("invalid_jpeg_structure")
 			}
 			restartInterval = int(binary.BigEndian.Uint16(payload))
-		case marker == 0xda:
+		case 0xda:
 			scans++
 			if frame == nil || scans > jpegMaxScans {
 				cleanFail("invalid_jpeg_structure")
@@ -1020,10 +1020,10 @@ func parseJPEG(b []byte, depth int, work *int64) jpegParseResult {
 				}
 			}
 			scan = validateSOS(payload, frame, huffman, scanned, progressive)
-		case marker == 0xfe:
+		case 0xfe:
 			keep = false
 			removed = true
-		case marker == 0xe0:
+		case 0xe0:
 			addMetadata(len(payload))
 			switch {
 			case bytes.HasPrefix(payload, jpegJFIFPrefix):
@@ -1047,7 +1047,7 @@ func parseJPEG(b []byte, depth int, work *int64) jpegParseResult {
 			default:
 				cleanFail("unsupported_jpeg_app")
 			}
-		case marker == 0xe1:
+		case 0xe1:
 			addMetadata(len(payload))
 			switch {
 			case bytes.HasPrefix(payload, jpegExifPrefix):
@@ -1095,7 +1095,7 @@ func parseJPEG(b []byte, depth int, work *int64) jpegParseResult {
 			default:
 				cleanFail("unsupported_jpeg_app")
 			}
-		case marker == 0xe2:
+		case 0xe2:
 			metadataBytes += len(payload)
 			if metadataBytes > jpegMaxMetadataBytes || !bytes.HasPrefix(payload, jpegICCPrefix) || len(payload) <= len(jpegICCPrefix)+2 {
 				cleanFail("unsupported_jpeg_app")
@@ -1110,7 +1110,7 @@ func parseJPEG(b []byte, depth int, work *int64) jpegParseResult {
 				}
 			}
 			iccParts = append(iccParts, jpegICCPart{sequence: sequence, count: count, data: payload[len(jpegICCPrefix)+2:]})
-		case marker == 0xeb:
+		case 0xeb:
 			if len(payload) < 9 || payload[0] != 0x4a || payload[1] != 0x50 {
 				cleanFail("unsupported_jpeg_app")
 			}
@@ -1126,7 +1126,7 @@ func parseJPEG(b []byte, depth int, work *int64) jpegParseResult {
 			jumbf[instance][sequence] = true
 			keep = false
 			removed = true
-		case marker == 0xed:
+		case 0xed:
 			metadataBytes += len(payload)
 			if metadataBytes > jpegMaxMetadataBytes || sawPhotoshop {
 				if sawPhotoshop {
@@ -1144,7 +1144,7 @@ func parseJPEG(b []byte, depth int, work *int64) jpegParseResult {
 				replacement = makeJPEGSegment(0xed, data)
 				rewritten = true
 			}
-		case marker == 0xee:
+		case 0xee:
 			addMetadata(len(payload))
 			if sawAdobe {
 				cleanFail("duplicate_jpeg_segment")
@@ -1152,7 +1152,6 @@ func parseJPEG(b []byte, depth int, work *int64) jpegParseResult {
 			validateAdobe(payload)
 			sawAdobe = true
 			adobeTransform = int(payload[11])
-		case marker == 0xc4 || marker == 0xdb || marker == 0xdd:
 		default:
 			if marker >= 0xe0 && marker <= 0xef {
 				cleanFail("unsupported_jpeg_app")
