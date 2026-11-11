@@ -1,6 +1,6 @@
 # YeaGrow execution-plane CI (fork-only; upstream workflows are unchanged).
 # Runs for the yeagrow/execution-plane branch and PRs based on it:
-#   - Go 1.27.3 build + `go test ./...` and `go test -tags=unit ./...`
+#   - Go 1.27.4 build + `go test ./...` and `go test -tags=unit ./...`
 #     (failing packages are rerun once, with warnings; see .github/yeagrow/go_test_rerun.py)
 #   - Docker image build with digest output, NOT pushed
 #   - GHCR publish job, disabled until the repository variable
@@ -43,7 +43,7 @@ jobs:
           cache: true
           cache-dependency-path: backend/go.sum
       - name: Verify Go version
-        run: go version | grep -q 'go1.27.3'
+        run: go version | grep -q 'go1.27.4'
       - name: Build
         working-directory: backend
         run: go build ./...
