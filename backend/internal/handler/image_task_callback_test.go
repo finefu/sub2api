@@ -38,6 +38,9 @@ func TestAsyncImageCallbackKeyRequiresRunIDIdempotencyKey(t *testing.T) {
 		req.Header.Set("Content-Type", "application/json")
 		if key != "" {
 			req.Header.Set("Idempotency-Key", key)
+			// T2.4: callback-enabled keys are execution-plane keys and send the asset headers.
+			req.Header.Set(service.ImageTaskAssetPrefixHeader, "generated/"+key+"/")
+			req.Header.Set(service.ImageTaskAssetMetadataHeader, `{"route_version":"route-v3","provider_id":"kemeitv","created_at":1794400000123}`)
 		}
 		w := httptest.NewRecorder()
 		router.ServeHTTP(w, req)

@@ -22,12 +22,27 @@ func (h *AsyncImageHandler) createImageTask(c *gin.Context, apiKey *service.APIK
 		// YeaGrow T2.2: callbacks carry run_id, which is the Idempotency-Key.
 		return nil, false, service.ErrImageTaskRunIDRequired
 	}
+	// YeaGrow T2.4: execution-plane submits carry the asset headers; validate
+	// them, require n = 1 and fold them into the idempotency fingerprint.
+	var plane *service.ImageTaskPlaneSpec
+	prefixHeader := c.GetHeader(service.ImageTaskAssetPrefixHeader)
+	metadataHeader := c.GetHeader(service.ImageTaskAssetMetadataHeader)
+	if service.IsExecutionPlaneSubmit(prefixHeader, metadataHeader, h.tasks.CallbacksConfiguredFor(apiKey.ID)) {
+		spec, err := service.ParseImageTaskPlaneSpec(strings.TrimSpace(rawKey), prefixHeader, metadataHeader)
+		if err != nil {
+			return nil, false, err
+		}
+		if err := service.ValidateExecutionPlaneN(c.GetHeader("Content-Type"), body); err != nil {
+			return nil, false, err
+		}
+		plane = spec
+	}
 	if strings.TrimSpace(rawKey) == "" {
 		task, err := h.tasks.Create(c.Request.Context(), owner)
 		return task, err == nil, err
 	}
-	fingerprint := service.ImageTaskIdempotencyFingerprint(c.Request.URL.Path, c.GetHeader("Content-Type"), body)
-	submission, err := h.tasks.CreateIdempotent(c.Request.Context(), owner, rawKey, fingerprint)
+	fingerprint := service.ImageTaskIdempotencyFingerprint(c.Request.URL.Path, c.GetHeader("Content-Type"), body, plane)
+	submission, err := h.tasks.CreateIdempotentWithPlane(c.Request.Context(), owner, rawKey, fingerprint, plane)
 	if err != nil {
 		if retryAfter := service.RetryAfterSecondsFromError(err); retryAfter > 0 {
 			c.Header("Retry-After", strconv.Itoa(retryAfter))

@@ -90,14 +90,21 @@ func (s *ImageTaskService) idempotencyTTL() time.Duration {
 
 // ImageTaskIdempotencyFingerprint fingerprints a submission: endpoint (with or
 // without the /v1 prefix), media type and the exact request body bytes.
-func ImageTaskIdempotencyFingerprint(path, contentType string, body []byte) string {
+// plane (YeaGrow T2.4, may be nil) folds the asset headers into the fingerprint.
+func ImageTaskIdempotencyFingerprint(path, contentType string, body []byte, plane ...*ImageTaskPlaneSpec) string {
 	endpoint := strings.TrimPrefix(strings.TrimSpace(path), "/v1")
 	mediaType := strings.ToLower(strings.TrimSpace(contentType))
 	if parsed, _, err := mime.ParseMediaType(contentType); err == nil {
 		mediaType = parsed
 	}
 	bodySum := sha256.Sum256(body)
-	sum := sha256.Sum256([]byte("image_task_async\n" + endpoint + "\n" + mediaType + "\n" + hex.EncodeToString(bodySum[:])))
+	material := "image_task_async\n" + endpoint + "\n" + mediaType + "\n" + hex.EncodeToString(bodySum[:])
+	for _, p := range plane {
+		if p != nil {
+			material += "\n" + p.fingerprintPart()
+		}
+	}
+	sum := sha256.Sum256([]byte(material))
 	return hex.EncodeToString(sum[:])
 }
 
@@ -119,6 +126,13 @@ func imageTaskIdempotencyScope(apiKeyID int64) string {
 // ErrIdempotencyInProgress (409 + retry_after, owner still creating),
 // ErrIdempotencyStoreUnavail / ErrImageTaskUnavailable (503).
 func (s *ImageTaskService) CreateIdempotent(ctx context.Context, owner ImageTaskOwner, rawKey, fingerprint string) (*ImageTaskSubmission, error) {
+	return s.CreateIdempotentWithPlane(ctx, owner, rawKey, fingerprint, nil)
+}
+
+// CreateIdempotentWithPlane is CreateIdempotent for execution-plane tasks
+// (YeaGrow T2.4): plane is stored on the created task record. The caller must
+// already have folded the plane spec into fingerprint.
+func (s *ImageTaskService) CreateIdempotentWithPlane(ctx context.Context, owner ImageTaskOwner, rawKey, fingerprint string, plane *ImageTaskPlaneSpec) (*ImageTaskSubmission, error) {
 	if s == nil || s.store == nil {
 		return nil, ErrImageTaskUnavailable
 	}
@@ -127,6 +141,9 @@ func (s *ImageTaskService) CreateIdempotent(ctx context.Context, owner ImageTask
 		return nil, err
 	}
 	if key == "" {
+		if plane != nil {
+			return nil, ErrImageTaskRunIDRequired
+		}
 		task, err := s.Create(ctx, owner)
 		if err != nil {
 			return nil, err
@@ -164,7 +181,7 @@ func (s *ImageTaskService) CreateIdempotent(ctx context.Context, owner ImageTask
 			return nil, ErrIdempotencyStoreUnavail.WithCause(err)
 		}
 		if claimed {
-			return s.createClaimedTask(ctx, repo, creator, claim.ID, owner, taskID, key, idemTTL)
+			return s.createClaimedTask(ctx, repo, creator, claim.ID, owner, taskID, key, plane, idemTTL)
 		}
 
 		existing, err := repo.GetByScopeAndKeyHash(ctx, scope, keyHash)
@@ -202,7 +219,7 @@ func (s *ImageTaskService) CreateIdempotent(ctx context.Context, owner ImageTask
 					return nil, ErrIdempotencyStoreUnavail.WithCause(err)
 				}
 				if taken {
-					return s.createClaimedTask(ctx, repo, creator, existing.ID, owner, taskID, key, idemTTL)
+					return s.createClaimedTask(ctx, repo, creator, existing.ID, owner, taskID, key, plane, idemTTL)
 				}
 			}
 		}
@@ -228,6 +245,7 @@ func (s *ImageTaskService) createClaimedTask(
 	owner ImageTaskOwner,
 	taskID string,
 	runID string,
+	plane *ImageTaskPlaneSpec,
 	idemTTL time.Duration,
 ) (*ImageTaskSubmission, error) {
 	now := time.Now().UTC()
@@ -239,6 +257,7 @@ func (s *ImageTaskService) createClaimedTask(
 		CreatedAt: now.Unix(),
 		ExpiresAt: now.Add(s.ttl).Unix(),
 		RunID:     runID,
+		Plane:     plane,
 	}
 	created, err := creator.SaveIfAbsent(ctx, record, s.ttl)
 	if err != nil {
